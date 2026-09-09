@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+"""
+neogreet - Modern, lightweight Catppuccin Mocha greeter for greetd
+https://github.com/neoth-revelation/neogreet
+"""
+
+import os
+import sys
+import json
+import struct
+import socket
+import shlex
+import glob
+import locale
+import threading
+from datetime import datetime
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gtk, Gdk, GLib
+
+
+_HAS_PL_LOCALE = False
+try:
+    locale.setlocale(locale.LC_TIME, "pl_PL.UTF-8")
+    _HAS_PL_LOCALE = True
+except Exception:
+    pass
+
+
+STATE_FILE = os.path.expanduser("~/.cache/neogreet/state.json")
+
+
+def load_state():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"last_user": "arek-s", "last_session": "Hyprland (uwsm-managed)"}
+
+
+def save_state(user, session_name):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"last_user": user, "last_session": session_name}, f)
+    except Exception:
+        pass
+
+
+class GreetdClient:
+    def __init__(self):
+        sock_path = os.environ.get("GREETD_SOCK")
+        self.sock = None
+        if sock_path and os.path.exists(sock_path):
+            try:
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.connect(sock_path)
+            except Exception as e:
+                print(f"Failed to connect to greetd socket: {e}", file=sys.stderr)
+                self.sock = None
+
+    def _recv_exact(self, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _send(self, payload):
+        if not self.sock:
+            return {"type": "success"}
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            self.sock.sendall(struct.pack("=I", len(data)) + data)
+            resp_len_bytes = self._recv_exact(4)
+            if resp_len_bytes is None:
+                return {"type": "error", "description": "Socket closed"}
+            resp_len = struct.unpack("=I", resp_len_bytes)[0]
+            resp_data = self._recv_exact(resp_len)
+            if resp_data is None:
+                return {"type": "error", "description": "Socket closed"}
+            return json.loads(resp_data.decode("utf-8"))
+        except Exception as e:
+            return {"type": "error", "description": str(e)}
+
+    def login(self, username, password, cmd):
+        if not self.sock:
+            if os.environ.get("NEOGREET_DEMO") == "1" or os.environ.get("ANTIGRAVITY_GREETER_DEMO") == "1":
+                print(f"[DEMO] Login attempt: user={username}, cmd={cmd}")
+                if password == "wrong":
+                    return {"type": "error", "error_type": "auth_error", "description": "Nieprawidłowe hasło"}
+                return {"type": "success"}
+            return {"type": "error", "error_type": "error", "description": "Brak połączenia z greetd"}
+
+        # 1. Create session
+        res = self._send({"type": "create_session", "username": username})
+        while res.get("type") == "auth_message":
+            msg_type = res.get("auth_message_type")
+            if msg_type == "secret":
+                res = self._send({"type": "post_auth_message_response", "response": password})
+            elif msg_type == "visible":
+                res = self._send({"type": "post_auth_message_response", "response": username})
+            else:
+                res = self._send({"type": "post_auth_message_response"})
+
+        if res.get("type") == "success":
+            # 2. Start session
+            start_res = self._send({
+                "type": "start_session",
+                "cmd": cmd,
+                "env": []
+            })
+            return start_res
+        else:
+            # Reset greetd transaction on failure
+            self._send({"type": "cancel_session"})
+            return res
+
+
+def scan_sessions(last_session_name=""):
+    sessions = []
+    selected_session = None
+    search_paths = ["/usr/share/wayland-sessions", "/usr/share/xsessions"]
+    seen_names = set()
+
+    for p in search_paths:
+        for f in sorted(glob.glob(os.path.join(p, "*.desktop"))):
+            name = None
+            cmd = None
+            try:
+                with open(f, "r", encoding="utf-8") as df:
+                    for line in df:
+                        line = line.strip()
+                        if line.startswith("Name=") and not name:
+                            name = line.split("=", 1)[1]
+                        elif line.startswith("Exec=") and not cmd:
+                            cmd_str = line.split("=", 1)[1]
+                            cmd = shlex.split(cmd_str)
+                if name and cmd and name not in seen_names:
+                    seen_names.add(name)
+                    item = {"name": name, "cmd": cmd, "file": f}
+                    sessions.append(item)
+                    if last_session_name and name == last_session_name:
+                        selected_session = item
+                    elif not selected_session and "uwsm" in name.lower():
+                        selected_session = item
+            except Exception:
+                continue
+
+    if not selected_session and sessions:
+        selected_session = sessions[0]
+    return sessions, selected_session
+
+
+CSS_DATA = b"""
+/* ==========================================================================
+   neogreet - Catppuccin Mocha Theme (Rofi Style)
+   ========================================================================== */
+
+* {
+    all: unset;
+}
+
+window {
+    background-color: transparent;
+    color: #cdd6f4;
+    font-family: "JetBrainsMono Nerd Font Propo", "JetBrainsMono Nerd Font", sans-serif;
+    font-size: 13pt;
+}
+
+/* Central Login Card */
+.login-card {
+    background-color: rgba(30, 30, 46, 0.93);
+    border: 1px solid rgba(69, 71, 90, 0.85);
+    border-radius: 24px;
+    padding: 34px 32px 30px 32px;
+    box-shadow: 0 20px 48px rgba(0, 0, 0, 0.65);
+    min-width: 380px;
+}
+
+/* Inputs */
+entry {
+    background-color: rgba(49, 50, 68, 0.93);
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    border-radius: 14px;
+    padding: 12px 16px;
+    font-size: 1.05rem;
+    caret-color: #cba6f7;
+    margin-bottom: 6px;
+    transition: all 150ms ease;
+}
+
+entry:focus-within {
+    border-color: #cba6f7;
+    box-shadow: 0 0 0 2px rgba(203, 166, 247, 0.4);
+}
+
+entry image.left,
+entry image.right {
+    color: #a6adc8;
+    padding: 0 4px;
+}
+
+entry:focus-within image.left {
+    color: #cba6f7;
+}
+
+/* Login Button */
+button.login-btn {
+    background: linear-gradient(90deg, #cba6f7, #f5c2e7);
+    color: #11111b;
+    border: none;
+    border-radius: 14px;
+    padding: 13px 0;
+    font-weight: 700;
+    font-size: 1.1rem;
+    box-shadow: 0 6px 18px rgba(203, 166, 247, 0.4);
+    transition: all 150ms ease;
+    margin-top: 8px;
+}
+
+button.login-btn:hover {
+    background: linear-gradient(90deg, #b4befe, #cba6f7);
+    box-shadow: 0 8px 24px rgba(203, 166, 247, 0.6);
+}
+
+button.login-btn:active {
+    box-shadow: 0 2px 8px rgba(203, 166, 247, 0.3);
+}
+
+/* Circular Icon Buttons (Power, Reboot, Session) */
+button.circle-btn {
+    background-color: rgba(30, 30, 46, 0.93);
+    color: #cdd6f4;
+    border: 1px solid rgba(69, 71, 90, 0.85);
+    border-radius: 50%;
+    min-width: 48px;
+    min-height: 48px;
+    padding: 0;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    transition: all 150ms ease;
+}
+
+button.circle-btn image {
+    -gtk-icon-size: 20px;
+}
+
+button.circle-btn:hover {
+    background-color: rgba(49, 50, 68, 0.98);
+    border-color: #cba6f7;
+    color: #cba6f7;
+    box-shadow: 0 8px 28px rgba(203, 166, 247, 0.35);
+}
+
+button.power-btn:hover {
+    background-color: rgba(243, 139, 168, 0.2);
+    border-color: #f38ba8;
+    color: #f38ba8;
+    box-shadow: 0 8px 28px rgba(243, 139, 168, 0.35);
+}
+
+/* Clock Header Pill */
+.clock-pill {
+    background-color: rgba(30, 30, 46, 0.93);
+    border: 1px solid rgba(69, 71, 90, 0.85);
+    border-top: none;
+    border-radius: 0 0 20px 20px;
+    padding: 8px 28px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    color: #cdd6f4;
+    font-weight: 700;
+    font-size: 1.15rem;
+}
+
+/* Error Label */
+.error-label {
+    color: #f38ba8;
+    font-size: 0.95rem;
+    font-weight: 600;
+    margin-top: 4px;
+}
+
+/* Popover Session Menu - Clean floating card */
+popover {
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+}
+
+popover > arrow {
+    background-color: transparent;
+    border: none;
+}
+
+popover > contents {
+    background-color: rgba(30, 30, 46, 0.98);
+    border: 1px solid rgba(69, 71, 90, 0.85);
+    border-radius: 16px;
+    padding: 8px;
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.7);
+    color: #cdd6f4;
+}
+
+.session-row {
+    padding: 10px 16px;
+    border-radius: 10px;
+    margin: 2px 0;
+    font-weight: 600;
+    transition: all 120ms ease;
+    color: #cdd6f4;
+}
+
+.session-row:hover {
+    background-color: rgba(49, 50, 68, 0.9);
+    color: #cba6f7;
+}
+
+.session-row.active {
+    background: linear-gradient(90deg, rgba(203, 166, 247, 0.25), rgba(245, 194, 231, 0.25));
+    color: #cba6f7;
+    border: 1px solid rgba(203, 166, 247, 0.5);
+}
+"""
+
+
+class NeogreetWindow(Gtk.ApplicationWindow):
+    def __init__(self, app, is_demo=False):
+        super().__init__(application=app, title="neogreet")
+        self.is_demo = is_demo
+
+        if self.is_demo:
+            self.set_default_size(1280, 720)
+            self.set_decorated(True)
+            self.set_title("neogreet [DEMO] – Wciśnij ESC aby wyjść")
+            # Close cleanly on Escape
+            key_ctrl = Gtk.EventControllerKey()
+            def on_key_pressed(_c, keyval, _keycode, _state):
+                if keyval == Gdk.KEY_Escape:
+                    self.get_application().quit()
+                    return True
+                return False
+            key_ctrl.connect("key-pressed", on_key_pressed)
+            self.add_controller(key_ctrl)
+        else:
+            self.set_default_size(1920, 1080)
+            self.set_decorated(False)
+            self.fullscreen()
+
+        self.client = GreetdClient()
+        self.state = load_state()
+        self.sessions, self.selected_session = scan_sessions(self.state.get("last_session", ""))
+
+        # Root Overlay
+        overlay = Gtk.Overlay()
+        self.set_child(overlay)
+
+        # 1. Background Wallpaper
+        bg_path = "/usr/share/backgrounds/greeter.png"
+        if os.path.exists(bg_path):
+            picture = Gtk.Picture.new_for_filename(bg_path)
+            picture.set_content_fit(Gtk.ContentFit.COVER)
+            overlay.set_child(picture)
+        else:
+            fallback = Gtk.Box()
+            overlay.set_child(fallback)
+
+        # 2. Top-Center Clock Pill
+        clock_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        clock_box.set_halign(Gtk.Align.CENTER)
+        clock_box.set_valign(Gtk.Align.START)
+        self.clock_label = Gtk.Label()
+        self.clock_label.add_css_class("clock-pill")
+        clock_box.append(self.clock_label)
+        overlay.add_overlay(clock_box)
+        self.update_clock()
+        GLib.timeout_add_seconds(1, self.update_clock)
+
+        # 3. Top-Right Buttons (Reboot, Power Off)
+        top_right_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        top_right_box.set_halign(Gtk.Align.END)
+        top_right_box.set_valign(Gtk.Align.START)
+        top_right_box.set_margin_top(24)
+        top_right_box.set_margin_end(28)
+
+        reboot_btn = Gtk.Button.new_from_icon_name("system-reboot-symbolic")
+        reboot_btn.add_css_class("circle-btn")
+        reboot_btn.set_tooltip_text("Uruchom ponownie")
+        reboot_btn.connect("clicked", self.on_reboot)
+        top_right_box.append(reboot_btn)
+
+        power_btn = Gtk.Button.new_from_icon_name("system-shutdown-symbolic")
+        power_btn.add_css_class("circle-btn")
+        power_btn.add_css_class("power-btn")
+        power_btn.set_tooltip_text("Wyłącz komputer")
+        power_btn.connect("clicked", self.on_poweroff)
+        top_right_box.append(power_btn)
+
+        overlay.add_overlay(top_right_box)
+
+        # 4. Bottom-Left Button (Session Selector)
+        bottom_left_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        bottom_left_box.set_halign(Gtk.Align.START)
+        bottom_left_box.set_valign(Gtk.Align.END)
+        bottom_left_box.set_margin_bottom(24)
+        bottom_left_box.set_margin_start(28)
+
+        self.session_btn = Gtk.Button.new_from_icon_name("view-app-grid-symbolic")
+        self.session_btn.add_css_class("circle-btn")
+        self.session_btn.set_tooltip_text(
+            f"Sesja: {self.selected_session['name'] if self.selected_session else 'Brak'}"
+        )
+        self.session_btn.connect("clicked", self.on_session_clicked)
+        bottom_left_box.append(self.session_btn)
+
+        # Popover for Session Selection (no arrow, clean floating card)
+        self.session_popover = Gtk.Popover()
+        self.session_popover.set_has_arrow(False)
+        self.session_popover.set_parent(self.session_btn)
+        self.session_popover.set_position(Gtk.PositionType.TOP)
+        self.build_session_menu()
+
+        overlay.add_overlay(bottom_left_box)
+
+        # 5. Center Login Card
+        center_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        center_container.set_halign(Gtk.Align.CENTER)
+        center_container.set_valign(Gtk.Align.CENTER)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        card.add_css_class("login-card")
+        center_container.append(card)
+
+        # Username Field (with icon inside)
+        self.user_entry = Gtk.Entry()
+        self.user_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, "avatar-default-symbolic")
+        self.user_entry.set_text(self.state.get("last_user", "arek-s"))
+        self.user_entry.set_placeholder_text("Użytkownik")
+        self.user_entry.connect("activate", lambda _: self.pass_entry.grab_focus())
+        card.append(self.user_entry)
+
+        # Password Field (with key icon inside & peek toggle)
+        self.pass_entry = Gtk.Entry()
+        self.pass_entry.set_visibility(False)
+        self.pass_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, "dialog-password-symbolic")
+        self.pass_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, "view-reveal-symbolic")
+        self.pass_entry.set_icon_activatable(Gtk.EntryIconPosition.SECONDARY, True)
+        self.pass_entry.connect("icon-press", self.on_password_peek_toggle)
+        self.pass_entry.set_placeholder_text("Hasło")
+        self.pass_entry.connect("activate", lambda _: self.on_login())
+        card.append(self.pass_entry)
+
+        # Error / Status Label
+        self.status_label = Gtk.Label()
+        self.status_label.add_css_class("error-label")
+        self.status_label.set_visible(False)
+        card.append(self.status_label)
+
+        # Login Button
+        self.login_btn = Gtk.Button(label="Zaloguj")
+        self.login_btn.add_css_class("login-btn")
+        self.login_btn.set_hexpand(True)
+        self.login_btn.connect("clicked", lambda _: self.on_login())
+        card.append(self.login_btn)
+
+        overlay.add_overlay(center_container)
+
+        # Auto-focus password entry cleanly
+        def _focus_pass_entry():
+            self.pass_entry.grab_focus()
+            return GLib.SOURCE_REMOVE
+        GLib.idle_add(_focus_pass_entry)
+
+    def update_clock(self):
+        now = datetime.now()
+        date_str = now.strftime("%A, %d %B %H:%M")
+        if _HAS_PL_LOCALE:
+            date_str = date_str.capitalize()
+        self.clock_label.set_text(date_str)
+        return GLib.SOURCE_CONTINUE
+
+    def on_password_peek_toggle(self, entry, icon_pos):
+        if icon_pos == Gtk.EntryIconPosition.SECONDARY:
+            current_vis = entry.get_visibility()
+            entry.set_visibility(not current_vis)
+            entry.set_icon_from_icon_name(
+                Gtk.EntryIconPosition.SECONDARY,
+                "view-conceal-symbolic" if not current_vis else "view-reveal-symbolic"
+            )
+
+    def on_reboot(self, _btn):
+        if self.is_demo:
+            self.show_error("[DEMO] Symulacja: restart komputera")
+            return
+        os.system("systemctl reboot -i")
+
+    def on_poweroff(self, _btn):
+        if self.is_demo:
+            self.show_error("[DEMO] Symulacja: wyłączenie komputera")
+            return
+        os.system("systemctl poweroff -i")
+
+    def on_session_clicked(self, _btn):
+        self.session_popover.popup()
+
+    def build_session_menu(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        for s in self.sessions:
+            btn = Gtk.Button(label=s["name"])
+            btn.add_css_class("session-row")
+            if self.selected_session and s["name"] == self.selected_session["name"]:
+                btn.add_css_class("active")
+
+            def make_handler(sess):
+                def handler(_):
+                    self.selected_session = sess
+                    self.session_btn.set_tooltip_text(f"Sesja: {sess['name']}")
+                    save_state(self.user_entry.get_text().strip(), sess["name"])
+                    self.build_session_menu()
+                    self.session_popover.popdown()
+                return handler
+
+            btn.connect("clicked", make_handler(s))
+            vbox.append(btn)
+        self.session_popover.set_child(vbox)
+
+    def on_login(self):
+        username = self.user_entry.get_text().strip()
+        password = self.pass_entry.get_text()
+
+        if not username:
+            self.show_error("Podaj nazwę użytkownika")
+            self.user_entry.grab_focus()
+            return
+
+        self.login_btn.set_sensitive(False)
+        self.status_label.set_text("Logowanie...")
+        self.status_label.set_visible(True)
+
+        cmd = self.selected_session["cmd"] if self.selected_session else ["Hyprland"]
+
+        def worker():
+            res = self.client.login(username, password, cmd)
+            GLib.idle_add(self._on_login_result, username, res)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_login_result(self, username, res):
+        if res.get("type") == "success":
+            save_state(username, self.selected_session["name"] if self.selected_session else "")
+            if self.is_demo:
+                self.status_label.set_text("✓ Zalogowano pomyślnie! (demo)")
+                self.status_label.set_visible(True)
+                GLib.timeout_add(1000, lambda: (self.get_application().quit(), GLib.SOURCE_REMOVE)[1])
+            else:
+                self.get_application().quit()
+        else:
+            err_desc = res.get("description") or "Błąd logowania"
+            if res.get("error_type") == "auth_error":
+                err_desc = "Nieprawidłowe hasło"
+            self.show_error(err_desc)
+            self.login_btn.set_sensitive(True)
+            self.pass_entry.set_text("")
+            self.pass_entry.grab_focus()
+        return GLib.SOURCE_REMOVE
+
+    def show_error(self, message):
+        self.status_label.set_text(message)
+        self.status_label.set_visible(True)
+
+
+class NeogreetApp(Gtk.Application):
+    def __init__(self, is_demo=False):
+        super().__init__(application_id="apps.neoth.neogreet")
+        self.is_demo = is_demo
+
+    def do_activate(self):
+        css_provider = Gtk.CssProvider()
+        css_provider.load_from_data(CSS_DATA)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        win = NeogreetWindow(self, is_demo=self.is_demo)
+        win.present()
+
+
+if __name__ == "__main__":
+    is_demo = False
+    filtered_argv = [sys.argv[0]]
+    for arg in sys.argv[1:]:
+        if arg in ("--demo", "-d"):
+            is_demo = True
+            os.environ["NEOGREET_DEMO"] = "1"
+        elif arg in ("--help", "-h"):
+            print("Użycie: neogreet [OPCJE]")
+            print("Opcje:")
+            print("  -d, --demo    Uruchamia greeter w oknie testowym (bez połączenia z greetd)")
+            print("  -h, --help    Wyświetla pomoc")
+            sys.exit(0)
+        else:
+            filtered_argv.append(arg)
+
+    app = NeogreetApp(is_demo=is_demo)
+    app.run(filtered_argv)
