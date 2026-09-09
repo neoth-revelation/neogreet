@@ -43,6 +43,9 @@
 - **🧪 Built-in Demo Mode (`--demo`)**:
   - Test and preview the greeter directly inside your active desktop environment without locking the screen or restarting `greetd`.
   - Press `ESC` to exit demo mode cleanly.
+- **🌐 Automatic Localization (i18n)**:
+  - Detects system language and locale (`$LANG`, `$LC_MESSAGES`, `$LC_TIME`).
+  - Native clock formatting and translated UI strings (English default for international users, Polish supported out-of-the-box, lightweight dictionary design for easy community contributions).
 - **🪶 Ultra Lightweight**:
   - Pure Python 3 + GTK4 (`python-gobject`).
   - Zero heavy rust compilation steps, zero Electron/Node overhead, zero pip dependencies.

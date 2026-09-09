@@ -21,12 +21,77 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Gtk, Gdk, GLib
 
 
-_HAS_PL_LOCALE = False
 try:
-    locale.setlocale(locale.LC_TIME, "pl_PL.UTF-8")
-    _HAS_PL_LOCALE = True
+    locale.setlocale(locale.LC_ALL, "")
 except Exception:
-    pass
+    try:
+        locale.setlocale(locale.LC_TIME, "")
+    except Exception:
+        pass
+
+
+TRANSLATIONS = {
+    "en": {
+        "user_placeholder": "Username",
+        "password_placeholder": "Password",
+        "login_btn": "Log In",
+        "logging_in": "Logging in...",
+        "login_success_demo": "✓ Login successful! (demo)",
+        "enter_username": "Please enter a username",
+        "invalid_password": "Invalid password",
+        "login_failed": "Authentication failed",
+        "no_greetd_conn": "Cannot connect to greetd socket",
+        "reboot_tooltip": "Restart",
+        "poweroff_tooltip": "Power Off",
+        "session_prefix": "Session",
+        "session_none": "None",
+        "demo_reboot": "[DEMO] Simulation: restart system",
+        "demo_poweroff": "[DEMO] Simulation: power off system",
+    },
+    "pl": {
+        "user_placeholder": "Użytkownik",
+        "password_placeholder": "Hasło",
+        "login_btn": "Zaloguj",
+        "logging_in": "Logowanie...",
+        "login_success_demo": "✓ Zalogowano pomyślnie! (demo)",
+        "enter_username": "Podaj nazwę użytkownika",
+        "invalid_password": "Nieprawidłowe hasło",
+        "login_failed": "Błąd logowania",
+        "no_greetd_conn": "Brak połączenia z greetd",
+        "reboot_tooltip": "Uruchom ponownie",
+        "poweroff_tooltip": "Wyłącz komputer",
+        "session_prefix": "Sesja",
+        "session_none": "Brak",
+        "demo_reboot": "[DEMO] Symulacja: restart komputera",
+        "demo_poweroff": "[DEMO] Symulacja: wyłączenie komputera",
+    },
+}
+
+
+def detect_language():
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        val = os.environ.get(var)
+        if val:
+            code = val.split(".")[0].split("_")[0].lower()
+            if code in TRANSLATIONS:
+                return code
+    try:
+        loc = locale.getlocale(locale.LC_MESSAGES)[0]
+        if loc:
+            code = loc.split("_")[0].lower()
+            if code in TRANSLATIONS:
+                return code
+    except Exception:
+        pass
+    return "en"
+
+
+CURRENT_LANG = detect_language()
+
+
+def tr(key):
+    lang_dict = TRANSLATIONS.get(CURRENT_LANG, TRANSLATIONS["en"])
+    return lang_dict.get(key, TRANSLATIONS["en"].get(key, key))
 
 
 STATE_FILE = os.path.expanduser("~/.cache/neogreet/state.json")
@@ -94,9 +159,9 @@ class GreetdClient:
             if os.environ.get("NEOGREET_DEMO") == "1" or os.environ.get("ANTIGRAVITY_GREETER_DEMO") == "1":
                 print(f"[DEMO] Login attempt: user={username}, cmd={cmd}")
                 if password == "wrong":
-                    return {"type": "error", "error_type": "auth_error", "description": "Nieprawidłowe hasło"}
+                    return {"type": "error", "error_type": "auth_error", "description": tr("invalid_password")}
                 return {"type": "success"}
-            return {"type": "error", "error_type": "error", "description": "Brak połączenia z greetd"}
+            return {"type": "error", "error_type": "error", "description": tr("no_greetd_conn")}
 
         # 1. Create session
         res = self._send({"type": "create_session", "username": username})
@@ -392,14 +457,14 @@ class NeogreetWindow(Gtk.ApplicationWindow):
 
         reboot_btn = Gtk.Button.new_from_icon_name("system-reboot-symbolic")
         reboot_btn.add_css_class("circle-btn")
-        reboot_btn.set_tooltip_text("Uruchom ponownie")
+        reboot_btn.set_tooltip_text(tr("reboot_tooltip"))
         reboot_btn.connect("clicked", self.on_reboot)
         top_right_box.append(reboot_btn)
 
         power_btn = Gtk.Button.new_from_icon_name("system-shutdown-symbolic")
         power_btn.add_css_class("circle-btn")
         power_btn.add_css_class("power-btn")
-        power_btn.set_tooltip_text("Wyłącz komputer")
+        power_btn.set_tooltip_text(tr("poweroff_tooltip"))
         power_btn.connect("clicked", self.on_poweroff)
         top_right_box.append(power_btn)
 
@@ -415,7 +480,7 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         self.session_btn = Gtk.Button.new_from_icon_name("view-app-grid-symbolic")
         self.session_btn.add_css_class("circle-btn")
         self.session_btn.set_tooltip_text(
-            f"Sesja: {self.selected_session['name'] if self.selected_session else 'Brak'}"
+            f"{tr('session_prefix')}: {self.selected_session['name'] if self.selected_session else tr('session_none')}"
         )
         self.session_btn.connect("clicked", self.on_session_clicked)
         bottom_left_box.append(self.session_btn)
@@ -442,7 +507,7 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         self.user_entry = Gtk.Entry()
         self.user_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, "avatar-default-symbolic")
         self.user_entry.set_text(self.state.get("last_user", ""))
-        self.user_entry.set_placeholder_text("Użytkownik")
+        self.user_entry.set_placeholder_text(tr("user_placeholder"))
         self.user_entry.connect("activate", lambda _: self.pass_entry.grab_focus())
         card.append(self.user_entry)
 
@@ -453,7 +518,7 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         self.pass_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, "view-reveal-symbolic")
         self.pass_entry.set_icon_activatable(Gtk.EntryIconPosition.SECONDARY, True)
         self.pass_entry.connect("icon-press", self.on_password_peek_toggle)
-        self.pass_entry.set_placeholder_text("Hasło")
+        self.pass_entry.set_placeholder_text(tr("password_placeholder"))
         self.pass_entry.connect("activate", lambda _: self.on_login())
         card.append(self.pass_entry)
 
@@ -464,7 +529,7 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         card.append(self.status_label)
 
         # Login Button
-        self.login_btn = Gtk.Button(label="Zaloguj")
+        self.login_btn = Gtk.Button(label=tr("login_btn"))
         self.login_btn.add_css_class("login-btn")
         self.login_btn.set_hexpand(True)
         self.login_btn.connect("clicked", lambda _: self.on_login())
@@ -481,9 +546,7 @@ class NeogreetWindow(Gtk.ApplicationWindow):
     def update_clock(self):
         now = datetime.now()
         date_str = now.strftime("%A, %d %B %H:%M")
-        if _HAS_PL_LOCALE:
-            date_str = date_str.capitalize()
-        self.clock_label.set_text(date_str)
+        self.clock_label.set_text(date_str.capitalize())
         return GLib.SOURCE_CONTINUE
 
     def on_password_peek_toggle(self, entry, icon_pos):
@@ -497,13 +560,13 @@ class NeogreetWindow(Gtk.ApplicationWindow):
 
     def on_reboot(self, _btn):
         if self.is_demo:
-            self.show_error("[DEMO] Symulacja: restart komputera")
+            self.show_error(tr("demo_reboot"))
             return
         os.system("systemctl reboot -i")
 
     def on_poweroff(self, _btn):
         if self.is_demo:
-            self.show_error("[DEMO] Symulacja: wyłączenie komputera")
+            self.show_error(tr("demo_poweroff"))
             return
         os.system("systemctl poweroff -i")
 
@@ -521,7 +584,7 @@ class NeogreetWindow(Gtk.ApplicationWindow):
             def make_handler(sess):
                 def handler(_):
                     self.selected_session = sess
-                    self.session_btn.set_tooltip_text(f"Sesja: {sess['name']}")
+                    self.session_btn.set_tooltip_text(f"{tr('session_prefix')}: {sess['name']}")
                     save_state(self.user_entry.get_text().strip(), sess["name"])
                     self.build_session_menu()
                     self.session_popover.popdown()
@@ -536,12 +599,12 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         password = self.pass_entry.get_text()
 
         if not username:
-            self.show_error("Podaj nazwę użytkownika")
+            self.show_error(tr("enter_username"))
             self.user_entry.grab_focus()
             return
 
         self.login_btn.set_sensitive(False)
-        self.status_label.set_text("Logowanie...")
+        self.status_label.set_text(tr("logging_in"))
         self.status_label.set_visible(True)
 
         cmd = self.selected_session["cmd"] if self.selected_session else ["Hyprland"]
@@ -556,15 +619,15 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         if res.get("type") == "success":
             save_state(username, self.selected_session["name"] if self.selected_session else "")
             if self.is_demo:
-                self.status_label.set_text("✓ Zalogowano pomyślnie! (demo)")
+                self.status_label.set_text(tr("login_success_demo"))
                 self.status_label.set_visible(True)
                 GLib.timeout_add(1000, lambda: (self.get_application().quit(), GLib.SOURCE_REMOVE)[1])
             else:
                 self.get_application().quit()
         else:
-            err_desc = res.get("description") or "Błąd logowania"
+            err_desc = res.get("description") or tr("login_failed")
             if res.get("error_type") == "auth_error":
-                err_desc = "Nieprawidłowe hasło"
+                err_desc = tr("invalid_password")
             self.show_error(err_desc)
             self.login_btn.set_sensitive(True)
             self.pass_entry.set_text("")
@@ -602,10 +665,16 @@ if __name__ == "__main__":
             is_demo = True
             os.environ["NEOGREET_DEMO"] = "1"
         elif arg in ("--help", "-h"):
-            print("Użycie: neogreet [OPCJE]")
-            print("Opcje:")
-            print("  -d, --demo    Uruchamia greeter w oknie testowym (bez połączenia z greetd)")
-            print("  -h, --help    Wyświetla pomoc")
+            if CURRENT_LANG == "pl":
+                print("Użycie: neogreet [OPCJE]")
+                print("Opcje:")
+                print("  -d, --demo    Uruchamia greeter w oknie testowym (bez połączenia z greetd)")
+                print("  -h, --help    Wyświetla pomoc")
+            else:
+                print("Usage: neogreet [OPTIONS]")
+                print("Options:")
+                print("  -d, --demo    Launch greeter in a floating test window (without greetd connection)")
+                print("  -h, --help    Display this help message")
             sys.exit(0)
         else:
             filtered_argv.append(arg)
