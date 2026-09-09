@@ -39,7 +39,7 @@ def load_state():
                 return json.load(f)
     except Exception:
         pass
-    return {"last_user": "arek-s", "last_session": "Hyprland (uwsm-managed)"}
+    return {"last_user": "", "last_session": "Hyprland (uwsm-managed)"}
 
 
 def save_state(user, session_name):
@@ -441,7 +441,7 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         # Username Field (with icon inside)
         self.user_entry = Gtk.Entry()
         self.user_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, "avatar-default-symbolic")
-        self.user_entry.set_text(self.state.get("last_user", "arek-s"))
+        self.user_entry.set_text(self.state.get("last_user", ""))
         self.user_entry.set_placeholder_text("Użytkownik")
         self.user_entry.connect("activate", lambda _: self.pass_entry.grab_focus())
         card.append(self.user_entry)

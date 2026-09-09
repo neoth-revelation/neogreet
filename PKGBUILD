@@ -1,4 +1,4 @@
-# Maintainer: neoth-revelation <arek.stankiewicz97@gmail.com>
+# Maintainer: neoth-revelation <https://github.com/neoth-revelation>
 pkgname=neogreet
 pkgver=0.1.0
 pkgrel=1
