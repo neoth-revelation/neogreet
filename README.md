@@ -30,8 +30,8 @@
   - Primary user icon embedded directly inside the username field.
   - Key icon embedded directly inside the password field, alongside a peek toggle eye icon.
   - Full-width action button matching input field dimensions.
-  - Initial focus on the username (or Log In for the remembered user).
-  - Interactive PAM questions: each password, OTP or other question sent by greetd is answered individually, never guessed or reused. Expired-password changes require backend support; see the authentication notes below.
+  - Username and password on one form, with initial focus on the password for the remembered user.
+  - Interactive PAM questions: the initial password is used once for a recognized password prompt; additional questions get separate answers. Expired-password changes require backend support; see the authentication notes below.
 - **⚡ Asynchronous & Non-Blocking**:
   - One IPC request at a time runs on a background worker; repeated Enter presses cannot overlap transactions.
   - Short-read-safe protocol, bounded frame sizes and a 60-second socket timeout.
@@ -192,14 +192,36 @@ produce a warning.
 
 ### Authentication and state
 
-Enter a username and select Log In; then answer each PAM question with Continue
-or Enter. Hidden and visible questions use the visibility requested by PAM.
+Enter a username and password, then select Log In or press Enter in the password
+field. Enter in the username field moves focus to the password. An empty username
+or password does not contact greetd or start a PAM attempt.
+
+The pre-entered password answers only the first input question, and only when it
+is a hidden standard English/Polish password prompt (`Password:` or `Hasło:`,
+also accepted without the colon). This is a narrow convenience for password
+authentication: greetd does not identify which PAM module asked a question.
+Unknown or visible questions discard the pre-entered password and require a new
+answer. OTP, repeated password and new-password questions are answered separately;
+the initial password is never reused. PAM error notices, cancellation, failures
+and successful authentication also discard any pending password. No password is
+saved to disk or logged; Python/GTK do not guarantee erasure of freed strings.
+
+For passwordless authentication or a fully interactive PAM conversation, set
+`password_first = false` in the `[authentication]` section of
+`/etc/greetd/neogreet.conf`. This starts with a username only. In either mode,
+additional questions use Continue or Enter and respect PAM's requested visibility.
 Informational messages and PAM error notices remain visible until you select
 Continue or press Enter; they are acknowledged with a null response. For example,
 acknowledge a fingerprint instruction before the backend continues with its scan.
 Cancel is available while waiting for your input or acknowledgement. In-flight
 socket operations have a 60-second timeout; this is not a deadline for the entire
 authentication conversation.
+
+Cancelling an already started conversation is sent as `cancel_session`, not an
+empty password. However, greetd 0.10.3 reports this to PAM as a conversation error;
+Arch's standard `pam_faillock` stack can count it as a failed attempt. The combined
+form avoids this for incomplete initial input by not starting PAM at all. It does
+not bypass lockouts or change cancellation accounting after an attempt starts.
 
 Actual PAM capabilities depend on greetd and the host's PAM configuration.
 The UI can answer successive new-password questions if greetd sends them, but
@@ -259,6 +281,7 @@ python -m py_compile bin/neogreet
 # On a GTK4 host with Xvfb and a session bus:
 dbus-run-session -- xvfb-run -a python tests/gtk_smoke.py
 dbus-run-session -- xvfb-run -a python tests/gtk_auth_flow.py
+dbus-run-session -- xvfb-run -a python tests/gtk_auth_flow.py --interactive
 dbus-run-session -- xvfb-run -a python tests/gtk_activation.py
 # On Arch, as a regular user with base-devel and python (no installation):
 python tests/package_smoke.py
@@ -270,9 +293,11 @@ encoding and the authentication UI state machine. A harmless argument-printing
 program checks the parsed Exec command through the same shell boundary as greetd.
 A local fake UNIX socket exercises fragmented replies and password + OTP exchange;
 that test explicitly skips if host policy prohibits sockets. The GTK smoke test
-opens a real demo window, checks a failed attempt, retries and exits on success.
+opens a real demo window, verifies keyboard focus and no requests for empty initial
+input, then checks single-submit login, a failed attempt, retry and success.
 Additional GTK tests use scripted replies to exercise notices, multiple questions,
-cancellation, repeated submissions and start failures with real worker threads.
+cancellation, repeated submissions and start failures with real worker threads,
+in both combined-form and fully interactive modes.
 Activation tests run independent demos while a harmless Gio application holds the
 production D-Bus name. GTK tests call the handlers; they do not synthesize physical
 keyboard input or authenticate through PAM.

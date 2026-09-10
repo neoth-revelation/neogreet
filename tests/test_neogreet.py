@@ -184,6 +184,16 @@ class StateAndSessionTests(unittest.TestCase):
             with self.assertLogs("neogreet", level="WARNING"):
                 self.assertEqual(app.load_config(path), app.load_config(path.with_name("missing")))
 
+    def test_password_first_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config"
+            self.assertTrue(app.load_config(path)["password_first"])
+            path.write_text("[authentication]\npassword_first = false\n")
+            self.assertFalse(app.load_config(path)["password_first"])
+            path.write_text("[authentication]\npassword_first = invalid\n")
+            with self.assertLogs("neogreet", level="WARNING"):
+                self.assertTrue(app.load_config(path)["password_first"])
+
     def test_xdg_empty_and_relative_values_use_defaults(self):
         for value in (None, "", "relative/path"):
             env = {} if value is None else {"XDG_DATA_DIRS": value, "XDG_CACHE_HOME": value}
@@ -289,21 +299,125 @@ class StateAndSessionTests(unittest.TestCase):
 
 
 class UIStateTests(unittest.TestCase):
-    def window(self):
+    def window(self, password_first=False):
         # Bind production state-machine methods to a display-free test harness.
         window = types.SimpleNamespace(busy=False, auth_active=False, awaiting_response=False,
-                                       prompt_kind=None, starting=False, cancelling=False, is_demo=False)
-        for name in ("on_login", "_on_login_result", "on_cancel", "reset_auth", "show_error"):
+                                       prompt_kind=None, starting=False, cancelling=False, is_demo=False,
+                                       password_first=password_first, pending_password=None)
+        for name in ("on_login", "on_username_activate", "_on_login_result", "on_cancel", "reset_auth", "show_error"):
             setattr(window, name, types.MethodType(getattr(app.NeogreetWindow, name), window))
         for name in ("user_entry", "pass_entry", "login_btn", "cancel_btn", "session_btn",
                      "session_popover", "status_label"):
             setattr(window, name, Mock())
         window.user_entry.get_text.return_value = "alice"
+        window.pass_entry.get_text.return_value = ""
+        window.pass_entry.set_text.side_effect = lambda text: setattr(window.pass_entry.get_text, "return_value", text)
         window.selected_session = {"name": "Session", "cmd": ["session"], "id": "session.desktop",
                                    "env": ["XDG_SESSION_TYPE=wayland"]}
         # Preserve the real busy transition while keeping replies under test control.
         window.send_request = Mock(side_effect=lambda _: setattr(window, "busy", True))
         return window
+
+    def test_empty_combined_form_never_starts_authentication(self):
+        window = self.window(password_first=True)
+        window.user_entry.get_text.return_value = ""
+        window.pass_entry.set_text("fixture")
+        window.on_login()
+        window.user_entry.get_text.return_value = "alice"
+        window.pass_entry.set_text("")
+        for _ in range(100):
+            window.on_username_activate(None)
+            window.on_login()
+            window.on_cancel(None)
+        window.send_request.assert_not_called()
+        self.assertFalse(window.auth_active)
+        self.assertIsNone(window.pending_password)
+        window.pass_entry.grab_focus.assert_called()
+
+    def test_combined_form_answers_password_once_then_waits_for_otp(self):
+        for prompt in ("Password: ", "Hasło: ", "Password", "Hasło"):
+            with self.subTest(prompt=prompt):
+                window = self.window(password_first=True)
+                window.pass_entry.set_text("  fixture password  ")
+                window.on_username_activate(None)
+                window.send_request.assert_not_called()
+                window.on_login()
+                window.send_request.assert_called_once_with({"type": "create_session", "username": "alice"})
+                self.assertEqual(window.pass_entry.get_text(), "")
+                window._on_login_result({"type": "auth_message", "auth_message_type": "secret", "auth_message": prompt})
+                window.send_request.assert_called_with({"type": "post_auth_message_response", "response": "  fixture password  "})
+                self.assertIsNone(window.pending_password)
+                for _ in range(100):
+                    window.on_login()
+                self.assertEqual(window.send_request.call_count, 2)
+                for question in ("OTP:", "Password:"):
+                    window.send_request.reset_mock()
+                    window._on_login_result({"type": "auth_message", "auth_message_type": "secret", "auth_message": question})
+                    window.send_request.assert_not_called()
+                    self.assertTrue(window.awaiting_response)
+                    self.assertEqual(window.pass_entry.get_text(), "")
+                    window.pass_entry.set_text("new-answer")
+                    window.on_login()
+                    window.send_request.assert_called_with({"type": "post_auth_message_response", "response": "new-answer"})
+
+    def test_prefilled_password_is_discarded_for_other_questions(self):
+        for kind, prompt in (("secret", "OTP:"), ("visible", "Password:"),
+                             ("secret", "Password and OTP:"), ("secret", "New password:"),
+                             ("secret", "Custom challenge:"), ("error", "Account notice")):
+            with self.subTest(kind=kind, prompt=prompt):
+                window = self.window(password_first=True)
+                window.pass_entry.set_text("must-not-send")
+                window.on_login()
+                window.send_request.reset_mock()
+                window._on_login_result({"type": "auth_message", "auth_message_type": kind, "auth_message": prompt})
+                window.send_request.assert_not_called()
+                self.assertIsNone(window.pending_password)
+                self.assertEqual(window.pass_entry.get_text(), "")
+                window.pass_entry.set_text("manual-answer")
+                window.on_login()
+                window.send_request.reset_mock()
+                window._on_login_result({"type": "auth_message", "auth_message_type": "secret", "auth_message": "Password:"})
+                window.send_request.assert_not_called()
+
+    def test_info_before_password_requires_acknowledgement(self):
+        window = self.window(password_first=True)
+        window.pass_entry.set_text("fixture")
+        window.on_login()
+        window.send_request.reset_mock()
+        window._on_login_result({"type": "auth_message", "auth_message_type": "info", "auth_message": "Notice"})
+        window.send_request.assert_not_called()
+        window.on_login()
+        window.send_request.assert_called_with({"type": "post_auth_message_response", "response": None})
+        window._on_login_result({"type": "auth_message", "auth_message_type": "secret", "auth_message": "Password:"})
+        window.send_request.assert_called_with({"type": "post_auth_message_response", "response": "fixture"})
+
+    def test_cancel_drops_prefill_and_retry_needs_new_password(self):
+        window = self.window(password_first=True)
+        window.pass_entry.set_text("fixture")
+        window.on_login()
+        window._on_login_result({"type": "auth_message", "auth_message_type": "info", "auth_message": "Notice"})
+        window.on_cancel(None)
+        window.send_request.assert_called_with({"type": "cancel_session"})
+        self.assertIsNone(window.pending_password)
+        window._on_login_result({"type": "success"})
+        window.pass_entry.set_visible.assert_called_with(True)
+        window.pass_entry.set_sensitive.assert_called_with(True)
+        window.pass_entry.grab_focus.assert_called()
+        window.send_request.reset_mock()
+        window.on_login()
+        window.send_request.assert_not_called()
+        window.pass_entry.set_text("retry-fixture")
+        window.on_login()
+        window.send_request.assert_called_once_with({"type": "create_session", "username": "alice"})
+
+    def test_error_or_success_before_password_clears_prefill(self):
+        for reply in ({"type": "error", "description": "Socket closed"}, {"type": "success"}):
+            window = self.window(password_first=True)
+            window.pass_entry.set_text("fixture")
+            window.on_login()
+            window._on_login_result(reply)
+            self.assertIsNone(window.pending_password)
+            self.assertEqual(window.pass_entry.get_text(), "")
 
     def test_repeated_enter_is_ignored(self):
         window = self.window()

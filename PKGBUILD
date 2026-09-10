@@ -1,7 +1,7 @@
 # Maintainer: neoth-revelation <https://github.com/neoth-revelation>
 pkgname=neogreet
 pkgver=0.1.0
-pkgrel=3
+pkgrel=4
 pkgdesc="Modern, sleek Catppuccin Mocha GTK4 greeter for greetd on Wayland"
 arch=('any')
 url="https://github.com/neoth-revelation/neogreet"
@@ -31,9 +31,9 @@ for _file in "${_files[@]}"; do
     _path=${_path//\]/%5D}
     source+=("${_hash%% *}-${_file##*/}::file://${_path}")
 done
-sha256sums=('3e8f69b0f4157c9adbdba1f0c839cac78fdda04f37a6c9ce58a1e75064c51138'
+sha256sums=('984c4d6e4b333ac13db2a16fb840c0d041da479fd66799ef841299f52af1e687'
             '058fc0fb157ccd4b064b0bf443dc6826e3127a07777e2a92b92ac696a5a48196'
-            'a987a00ffda591508a0794c1b737e3f23a459a78a1b536a158c11c478a29bf46'
+            'f7f9faf7bdd690a71845fbb94f7cf3d8b96dce2552c9744ca820c86f90f7edce'
             '3b6b6c6f6313ce111a67d981322acfd80742747443457d66bb74621c93f63805'
             '4660962838bdea53ce41262fce41c33108b6fbf7f65267c114d176a77d4f3947')
 

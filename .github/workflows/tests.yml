@@ -12,7 +12,9 @@ jobs:
       - run: dbus-run-session -- xvfb-run -a /usr/bin/python3 tests/gtk_smoke.py
         env:
           GSK_RENDERER: cairo
-      - run: dbus-run-session -- xvfb-run -a /usr/bin/python3 tests/gtk_auth_flow.py
+      - run: |
+          dbus-run-session -- xvfb-run -a /usr/bin/python3 tests/gtk_auth_flow.py
+          dbus-run-session -- xvfb-run -a /usr/bin/python3 tests/gtk_auth_flow.py --interactive
         env:
           GSK_RENDERER: cairo
       - run: dbus-run-session -- xvfb-run -a /usr/bin/python3 tests/gtk_activation.py

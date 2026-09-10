@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import sys
 from unittest.mock import patch
 
 loader = importlib.machinery.SourceFileLoader("neogreet", str(Path(__file__).resolve().parents[1] / "bin/neogreet"))
@@ -19,12 +20,13 @@ def question(kind, text):
 
 
 success = {"type": "success"}
+password_first = "--interactive" not in sys.argv
 conversation = [
     ({"type": "create_session", "username": "fixture"}, question("info", "Notice one")),
-    ({"type": "post_auth_message_response", "response": None}, question("error", "Notice two")),
     ({"type": "post_auth_message_response", "response": None}, question("secret", "Password")),
     ({"type": "post_auth_message_response", "response": "fixture-Password"}, question("secret", "OTP")),
-    ({"type": "post_auth_message_response", "response": "fixture-OTP"}, question("visible", "Recovery")),
+    ({"type": "post_auth_message_response", "response": "fixture-OTP"}, question("error", "Notice two")),
+    ({"type": "post_auth_message_response", "response": None}, question("visible", "Recovery")),
     ({"type": "post_auth_message_response", "response": "fixture-Recovery"}, question("secret", "New password")),
     ({"type": "post_auth_message_response", "response": "fixture-New password"}, question("secret", "Confirm password")),
     ({"type": "post_auth_message_response", "response": "fixture-Confirm password"}, success),
@@ -78,6 +80,8 @@ with tempfile.TemporaryDirectory() as directory:
                 window.client.request = backend
                 window.add_tick_callback(tick)
                 window.user_entry.set_text("fixture")
+                if password_first:
+                    window.pass_entry.set_text("fixture-Password")
                 window.on_login()
                 for _ in range(100):
                     window.on_login()
@@ -99,6 +103,8 @@ with tempfile.TemporaryDirectory() as directory:
                 elif not window.auth_active:
                     assert window.status_label.get_text() == "Start failed"
                     assert window.user_entry.get_sensitive() and window.session_btn.get_sensitive()
+                    if password_first:
+                        window.pass_entry.set_text("cancel-fixture")
                     window.on_login()
                     stage[0] = 2
             elif stage[0] == 2 and window.awaiting_response:
@@ -106,6 +112,9 @@ with tempfile.TemporaryDirectory() as directory:
                 stage[0] = 3
             elif stage[0] == 3 and not window.auth_active:
                 assert window.pass_entry.get_text() == ""
+                assert window.pending_password is None
+                if password_first:
+                    window.pass_entry.set_text("must-not-answer-unknown-prompt")
                 window.on_login()
                 stage[0] = 4
             elif stage[0] == 4 and window.awaiting_response:
@@ -130,7 +139,8 @@ with tempfile.TemporaryDirectory() as directory:
             patch.object(module.subprocess, "run", side_effect=AssertionError("Power action executed")), \
             patch.object(module.GreetdClient, "_connect", side_effect=AssertionError("Connected to greetd")), \
             patch.object(module.NeogreetWindow, "_on_login_result", result):
-        application = module.NeogreetApp(is_demo=True, config={"wallpaper": "", "clock_format": "%H:%M", "css": ""})
+        application = module.NeogreetApp(is_demo=True, config={"wallpaper": "", "clock_format": "%H:%M", "css": "",
+                                                              "password_first": password_first})
         GLib.timeout_add(50, exercise)
         watchdog = GLib.timeout_add_seconds(10, timeout)
         application.run(["neogreet-conversation"])
@@ -139,4 +149,4 @@ with tempfile.TemporaryDirectory() as directory:
     assert len(requests) == len(callbacks) == len(conversation)
     assert {"Notice one", "Notice two"} <= rendered
     assert stage[0] == 5
-    print("GTK conversation passed: notices, multiple prompts, Enter, cancellation, start failure and retry")
+    print(f"GTK conversation passed (password_first={password_first}): notices, multiple prompts, Enter, cancellation, start failure and retry")

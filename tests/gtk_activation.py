@@ -31,6 +31,8 @@ def preview(directory, name):
                 assert window is not None and window.is_demo
                 assert not application.get_is_remote()
                 assert window.clock_label.get_text() == name
+                assert window.pass_entry.get_visible()
+                assert window.get_focus() is window.user_entry.get_delegate()
                 application.activate()
                 assert application.get_windows() == [window]
                 Path(directory, name).touch()

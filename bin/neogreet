@@ -50,6 +50,7 @@ TRANSLATIONS = {
         "logging_in": "Logging in...",
         "login_success_demo": "✓ Login successful! (demo)",
         "enter_username": "Please enter a username",
+        "enter_password": "Please enter a password",
         "invalid_password": "Invalid password",
         "login_failed": "Authentication failed",
         "no_greetd_conn": "Cannot connect to greetd socket",
@@ -73,6 +74,7 @@ TRANSLATIONS = {
         "logging_in": "Logowanie...",
         "login_success_demo": "✓ Zalogowano pomyślnie! (demo)",
         "enter_username": "Podaj nazwę użytkownika",
+        "enter_password": "Podaj hasło",
         "invalid_password": "Nieprawidłowe hasło",
         "login_failed": "Błąd logowania",
         "no_greetd_conn": "Brak połączenia z greetd",
@@ -188,10 +190,12 @@ def load_config(path):
         if parser.has_section("appearance"):
             config.update({key: parser.get("appearance", key, fallback=value)
                            for key, value in config.items()})
+        config["password_first"] = parser.getboolean("authentication", "password_first", fallback=True)
     except FileNotFoundError:
         pass
-    except (OSError, UnicodeError, configparser.Error):
+    except (OSError, ValueError, configparser.Error):
         LOG.warning("Cannot read configuration; using defaults")
+    config.setdefault("password_first", True)
     return config
 
 
@@ -585,6 +589,8 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         super().__init__(application=app, title="neogreet")
         self.is_demo = is_demo
         self.config = app.config
+        self.password_first = self.config.get("password_first", True)
+        self.pending_password = None
         self.busy = False
         self.auth_active = False
         self.awaiting_response = False
@@ -700,13 +706,13 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         self.user_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, "avatar-default-symbolic")
         self.user_entry.set_text(self.state.get("last_user", ""))
         self.user_entry.set_placeholder_text(tr("user_placeholder"))
-        self.user_entry.connect("activate", lambda _: self.on_login())
+        self.user_entry.connect("activate", self.on_username_activate)
         card.append(self.user_entry)
 
         # Password Field (with key icon inside & peek toggle)
         self.pass_entry = Gtk.Entry()
         self.pass_entry.set_visibility(False)
-        self.pass_entry.set_visible(False)
+        self.pass_entry.set_visible(self.password_first)
         self.pass_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, "dialog-password-symbolic")
         self.pass_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, "view-reveal-symbolic")
         self.pass_entry.set_icon_activatable(Gtk.EntryIconPosition.SECONDARY, True)
@@ -737,9 +743,10 @@ class NeogreetWindow(Gtk.ApplicationWindow):
 
         overlay.add_overlay(center_container)
 
-        # Authentication questions are shown only when PAM actually asks them.
+        # A remembered username lets the user type their password immediately.
         def _focus_pass_entry():
-            (self.login_btn if self.user_entry.get_text() else self.user_entry).grab_focus()
+            target = self.pass_entry if self.password_first else self.login_btn
+            (target if self.user_entry.get_text() else self.user_entry).grab_focus()
             return GLib.SOURCE_REMOVE
         GLib.idle_add(_focus_pass_entry)
 
@@ -835,6 +842,12 @@ class NeogreetWindow(Gtk.ApplicationWindow):
             vbox.append(btn)
         self.session_popover.set_child(vbox)
 
+    def on_username_activate(self, _entry):
+        if self.password_first and not self.auth_active:
+            self.pass_entry.grab_focus()
+        else:
+            self.on_login()
+
     def on_login(self):
         if self.busy:
             return
@@ -858,6 +871,15 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         if not self.selected_session:
             self.show_error(tr("no_sessions"))
             return
+        if self.password_first:
+            password = self.pass_entry.get_text()
+            if not password:
+                self.show_error(tr("enter_password"))
+                self.pass_entry.grab_focus()
+                return
+            self.pending_password = password
+        self.pass_entry.set_text("")
+        self.pass_entry.set_visibility(False)
         self.auth_active = True
         self.login_user = username
         self.login_session = {**self.selected_session,
@@ -887,21 +909,27 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         if self.busy or not self.auth_active:
             return
         self.cancelling = True
+        self.pending_password = None
         self.pass_entry.set_text("")
         self.send_request({"type": "cancel_session"})
 
     def reset_auth(self):
         self.auth_active = self.awaiting_response = self.starting = self.cancelling = False
         self.prompt_kind = None
+        self.pending_password = None
         self.user_entry.set_sensitive(True)
         self.session_btn.set_sensitive(True)
         self.login_btn.set_label(tr("login_btn"))
         self.login_btn.set_sensitive(True)
         self.pass_entry.set_text("")
         self.pass_entry.set_visibility(False)
-        self.pass_entry.set_visible(False)
+        self.pass_entry.set_visible(self.password_first)
+        self.pass_entry.set_sensitive(True)
+        self.pass_entry.set_placeholder_text(tr("password_placeholder"))
+        self.pass_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, "view-reveal-symbolic")
         self.cancel_btn.set_visible(False)
-        self.login_btn.grab_focus()
+        target = self.pass_entry if self.password_first else self.login_btn
+        (target if self.user_entry.get_text() else self.user_entry).grab_focus()
 
     def _on_login_result(self, res):
         self.busy = False
@@ -914,6 +942,15 @@ class NeogreetWindow(Gtk.ApplicationWindow):
             return GLib.SOURCE_REMOVE
         if res["type"] == "auth_message":
             kind = res["auth_message_type"]
+            if kind in ("secret", "visible", "error"):
+                password, self.pending_password = self.pending_password, None
+                # greetd only supplies visibility, not the purpose of a question.
+                # Recognize the standard English/Polish Linux-PAM password prompt;
+                # never answer an OTP, visible or unknown prompt with this password.
+                if (password is not None and kind == "secret"
+                        and res["auth_message"].strip() in ("Password:", "Password", "Hasło:", "Hasło")):
+                    self.send_request({"type": "post_auth_message_response", "response": password})
+                    return GLib.SOURCE_REMOVE
             self.show_error(res["auth_message"])
             self.prompt_kind = kind
             self.awaiting_response = True
@@ -935,6 +972,7 @@ class NeogreetWindow(Gtk.ApplicationWindow):
                 self.pass_entry.set_sensitive(True)
                 self.pass_entry.grab_focus()
         elif res["type"] == "success" and not self.starting:
+            self.pending_password = None
             self.starting = True
             self.send_request(session_start_request(self.login_session))
         elif res["type"] == "success":
@@ -995,7 +1033,7 @@ class NeogreetApp(Gtk.Application):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-d", "--demo", action="store_true", help="Preview without greetd or power actions")
-    parser.add_argument("--config", default="/etc/greetd/neogreet.conf", help="Appearance configuration file")
+    parser.add_argument("--config", default="/etc/greetd/neogreet.conf", help="Greeter configuration file")
     args = parser.parse_args()
     app = NeogreetApp(is_demo=args.demo, config=load_config(args.config))
     app.run([sys.argv[0]])
