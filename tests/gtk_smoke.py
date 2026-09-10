@@ -19,7 +19,7 @@ with tempfile.TemporaryDirectory() as directory:
     config = {"wallpaper": "", "clock_format": "%A %B %H:%M", "css": ""}
     failures = []
     with patch.dict(os.environ, {"XDG_DATA_DIRS": directory, "GREETD_SOCK": "/must-not-connect"}), \
-            patch.object(module.socket, "socket", side_effect=AssertionError("Demo connected to socket")):
+            patch.object(module.GreetdClient, "_connect", side_effect=AssertionError("Demo connected to greetd")):
         application = module.NeogreetApp(is_demo=True, config=config)
         stages = [0]
 
