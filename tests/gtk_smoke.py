@@ -4,6 +4,7 @@ import importlib.util
 import os
 from pathlib import Path
 import tempfile
+import traceback
 from unittest.mock import Mock, patch
 
 loader = importlib.machinery.SourceFileLoader("neogreet", str(Path(__file__).resolve().parents[1] / "bin/neogreet"))
@@ -33,6 +34,10 @@ with tempfile.TemporaryDirectory() as directory:
                 if window is None or window.busy:
                     return GLib.SOURCE_CONTINUE
                 if stages[0] == 0:
+                    # Slow startup can make this timer due before GTK's initial
+                    # focus idle callback. Wait for it, bounded by the watchdog.
+                    if window.get_focus() is not window.pass_entry.get_delegate():
+                        return GLib.SOURCE_CONTINUE
                     application.activate()
                     assert application.get_windows() == [window]
                     assert window.user_entry.get_text() == "demo"
@@ -71,12 +76,13 @@ with tempfile.TemporaryDirectory() as directory:
                     return GLib.SOURCE_REMOVE
                 return GLib.SOURCE_CONTINUE
             except Exception as error:
+                traceback.print_exc()
                 failures.append(error)
                 application.quit()
                 return GLib.SOURCE_REMOVE
 
         def timeout():
-            failures.append(AssertionError("GTK smoke test timed out"))
+            failures.append(AssertionError(f"GTK smoke test timed out at stage {stages[0]} (initial focus or login)"))
             application.quit()
             return GLib.SOURCE_REMOVE
 

@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import traceback
 from unittest.mock import patch
 
 import gi
@@ -29,6 +30,8 @@ def preview(directory, name):
             if not checked[0]:
                 window = application.get_active_window()
                 assert window is not None and window.is_demo
+                if window.get_focus() is not window.user_entry.get_delegate():
+                    return GLib.SOURCE_CONTINUE
                 assert not application.get_is_remote()
                 assert window.clock_label.get_text() == name
                 assert window.pass_entry.get_visible()
@@ -43,6 +46,7 @@ def preview(directory, name):
                 return GLib.SOURCE_REMOVE
             return GLib.SOURCE_CONTINUE
         except Exception as error:
+            traceback.print_exc()
             failures.append(error)
             application.quit()
             return GLib.SOURCE_REMOVE

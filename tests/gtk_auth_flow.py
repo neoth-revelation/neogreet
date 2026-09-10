@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import threading
 import sys
+import traceback
 from unittest.mock import patch
 
 loader = importlib.machinery.SourceFileLoader("neogreet", str(Path(__file__).resolve().parents[1] / "bin/neogreet"))
@@ -64,6 +65,7 @@ with tempfile.TemporaryDirectory() as directory:
                 assert gate.wait(3), "Initial request was not released"
             return reply
         except Exception as error:
+            traceback.print_exc()
             failures.append(error)
             return {"type": "error", "description": "Test backend failed"}
 
@@ -123,6 +125,7 @@ with tempfile.TemporaryDirectory() as directory:
                 stage[0] = 5
             return GLib.SOURCE_CONTINUE
         except Exception as error:
+            traceback.print_exc()
             failures.append(error)
             application.quit()
             return GLib.SOURCE_REMOVE
