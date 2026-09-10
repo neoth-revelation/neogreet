@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python: 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
-[![GTK: 4.0](https://img.shields.io/badge/GTK-4.0-green.svg)](https://www.gtk.org/)
+[![GTK: 4.8+](https://img.shields.io/badge/GTK-4.8+-green.svg)](https://www.gtk.org/)
 [![Compositor: Wayland](https://img.shields.io/badge/compositor-Wayland-orange.svg)](https://wayland.freedesktop.org/)
 
 <br />
@@ -30,19 +30,22 @@
   - Primary user icon embedded directly inside the username field.
   - Key icon embedded directly inside the password field, alongside a peek toggle eye icon.
   - Full-width action button matching input field dimensions.
-  - Automatic initial focus on the password field for instant login.
+  - Initial focus on the username (or Log In for the remembered user).
+  - Interactive PAM questions: passwords, OTP codes and password changes are answered individually, never guessed or reused.
 - **⚡ Asynchronous & Non-Blocking**:
-  - PAM authentication exchange runs on a dedicated background worker thread (`threading.Thread`), keeping the GTK main loop responsive and fluid even during heavy cryptographic key stretching (bcrypt / argon2).
-  - Short-read safe socket protocol implementation (`_recv_exact`).
+  - One IPC request at a time runs on a background worker; repeated Enter presses cannot overlap transactions.
+  - Short-read-safe protocol, bounded frame sizes and a 60-second socket timeout.
 - **🎛️ Bottom-Left Session Selector**:
   - Unobtrusive circular icon button in the lower-left corner.
-  - Pops up a clean floating card scanning available `.desktop` sessions from `/usr/share/wayland-sessions/`.
+  - Scans Wayland sessions in `XDG_DATA_DIRS` (default `/usr/local/share:/usr/share`). Honors hidden entries, `TryExec`, localized names and supported `Exec` field codes.
   - Automatically remembers your last selected session across reboots.
 - **⏻ Quick Power Controls**:
   - Circular **Reboot** and **Power Off** buttons neatly positioned in the upper-right corner with soft hover glows.
+  - Confirmation dialog, asynchronous execution and error feedback; does not bypass systemd inhibitors.
 - **🧪 Built-in Demo Mode (`--demo`)**:
   - Test and preview the greeter directly inside your active desktop environment without locking the screen or restarting `greetd`.
   - Press `ESC` to exit demo mode cleanly.
+  - Never connects to `greetd`, executes power actions or writes remembered state, even when `GREETD_SOCK` is present.
 - **🌐 Automatic Localization (i18n)**:
   - Detects system language and locale (`$LANG`, `$LC_MESSAGES`, `$LC_TIME`).
   - Native clock formatting and translated UI strings (English default for international users, Polish supported out-of-the-box, lightweight dictionary design for easy community contributions).
@@ -59,8 +62,8 @@
 - **[`greetd`](https://git.sr.ht/~kennylevinsen/greetd)**
 - **`python`** (>= 3.10)
 - **`python-gobject`** (PyGObject with GTK4)
-- **`gtk4`**
-- **`papirus-icon-theme`** (for clean symbolic icons)
+- **`gtk4`** (>= 4.8)
+- Optional: **`papirus-icon-theme`** and **`ttf-jetbrains-mono-nerd`** for the screenshot styling
 - Any lightweight Wayland compositor to host the greeter (e.g. **Hyprland**, **Sway**, or **Cage**).
 
 ---
@@ -75,6 +78,14 @@ cd neogreet
 makepkg -si
 ```
 
+Run from a complete checkout with Arch's `base-devel` installed. This is a
+checkout-local PKGBUILD: `file://` sources explicitly locate files in `bin/`
+and `examples/`, with checksums for their contents. It is not a standalone AUR
+PKGBUILD or a portable source-only package; those should use a tagged archive.
+After editing packaged files, regenerate checksums with `updpkgsums` (pacman-contrib).
+Example configurations are installed under `/usr/share/doc/neogreet/`.
+Installation does **not** enable/restart greetd or overwrite `/etc/greetd/`.
+
 ### Manual Install (Any Distribution)
 
 ```bash
@@ -86,6 +97,10 @@ sudo install -m 755 bin/neogreet /usr/local/bin/neogreet
 ---
 
 ## ⚙️ Configuration
+
+Keep a working TTY login and a backup of your display-manager configuration
+before switching greeters. Test with `--demo` first. Do not run this application
+as root, and do not use it as a session lock screen.
 
 ### 1. Configure `greetd` (`/etc/greetd/config.toml`)
 
@@ -139,13 +154,61 @@ misc {
     disable_splash_rendering = true
 }
 
-# Pin fullscreen window to primary display if multi-monitor
+# Request fullscreen; monitor selection is compositor-specific.
 windowrule = match:class ^(apps\.neoth\.neogreet|neogreet)$, fullscreen on
 
-# Launch wallpaper & greeter
-exec-once = swaybg -i /usr/share/backgrounds/greeter.png -m fill
+# Optional wallpaper on other displays (install your own readable image first):
+# exec-once = swaybg -i /usr/share/backgrounds/greeter.png -m fill
 exec-once = neogreet; hyprctl dispatch exit
 ```
+
+`kb_layout = pl` is an example; set your actual keyboard layout. The fullscreen
+rule does not select a primary monitor. Configure monitor placement in your
+compositor as needed. The greeter has one interactive window, not one per display.
+
+### 3. Optional appearance (`/etc/greetd/neogreet.conf`)
+
+This is an **INI** file for neogreet, separate from greetd's TOML configuration.
+Use `examples/neogreet.conf` as a starting point:
+
+```ini
+[appearance]
+wallpaper = /usr/share/backgrounds/greeter.png
+clock_format = %A, %d %B %H:%M
+css =
+```
+
+No wallpaper is bundled. Install your own image at the chosen path and ensure
+the `greeter` account can read it (including parent directories). An absent or
+empty wallpaper uses a solid Catppuccin background, so a fresh installation does
+not require an image. `css` optionally points to a trusted local GTK4 stylesheet;
+the built-in theme remains the default. Preview another config without modifying
+system files with `neogreet --demo --config /path/to/neogreet.conf`.
+
+### Authentication and state
+
+Enter a username and select Log In; then answer each PAM question with Continue
+or Enter. Hidden and visible questions use the visibility requested by PAM.
+Informational messages are shown and acknowledged without a response. Cancel
+is available while waiting for your input; in-flight requests have a 60-second
+socket timeout. Actual PAM capabilities depend on the host's PAM configuration.
+Fingerprint/OTP/password-change flows still need end-to-end testing on that host.
+
+Session entries launch their declared Wayland command. X11 entries are deliberately
+not listed: their `Exec` alone does not start an X server. An empty session list
+produces an error instead of silently guessing `Hyprland`.
+
+Only the username and stable session file ID are stored under
+`$XDG_CACHE_HOME/neogreet/state.json` (default `~/.cache/neogreet/state.json`),
+using atomic replacement and mode 0600. This is the **greeter account's** cache,
+not the logged-in user's. Ensure that account has a writable cache directory;
+otherwise login still works but state is not persisted and a warning is logged.
+Do not weaken permissions on user home directories to achieve this.
+
+Power actions require the permissions normally provided by logind/polkit for
+the active greeter session. Failures are displayed; no passwordless sudo rule or
+blanket polkit authorization is installed. Inspect `journalctl -u greetd -b` when
+diagnosing startup, cache or power problems. Credentials are never logged.
 
 ---
 
@@ -161,8 +224,28 @@ neogreet -d
 
 - Spawns in a floating 1280x720 window.
 - Safe power buttons (simulates reboot/shutdown without affecting your machine).
-- Test login with any password (enter `wrong` to test authentication error feedback).
+- Select a session and enter a username; click Log In, then answer the simulated password question. Any password succeeds except `wrong`.
 - Press `ESC` to close the window.
+
+---
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+python -m py_compile bin/neogreet
+# On a GTK4 host with Xvfb and a session bus:
+dbus-run-session -- xvfb-run -a python tests/gtk_smoke.py
+```
+
+Headless tests cover protocol framing, explicit demo isolation, malformed state,
+session filtering, locale precedence and the authentication UI state machine.
+A local fake UNIX socket exercises fragmented replies and password + OTP exchange;
+that test explicitly skips if host policy prohibits sockets. The GTK smoke test
+opens a real demo window, checks a failed attempt, retries and exits on success.
+GitHub Actions also builds the Arch package without installing or enabling greetd.
+These checks do not replace a real Wayland/greetd/PAM login test in a VM or on a
+machine with a verified TTY recovery path.
 
 ---
 

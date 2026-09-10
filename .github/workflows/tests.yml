@@ -1,0 +1,28 @@
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  unit-and-gtk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s tests -v
+      - run: sudo apt-get update && sudo apt-get install -y python3-gi gir1.2-gtk-4.0 xvfb dbus-x11
+      - run: dbus-run-session -- xvfb-run -a /usr/bin/python3 tests/gtk_smoke.py
+        env:
+          GSK_RENDERER: cairo
+  arch-package:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm git python
+      - uses: actions/checkout@v4
+      - name: Build without installing or enabling greetd
+        run: |
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -c "cd '$GITHUB_WORKSPACE' && makepkg --nodeps --noconfirm"
+          bsdtar -tf neogreet-*.pkg.tar.zst | tee package-files.txt
+          test -f src/neogreet
+          test -f src/neogreet.conf
