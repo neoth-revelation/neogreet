@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import socket
 import struct
+import subprocess
 import tempfile
 import threading
 import types
@@ -25,6 +26,7 @@ repository.Gtk = types.SimpleNamespace(ApplicationWindow=object, Application=obj
                                        EntryIconPosition=types.SimpleNamespace(SECONDARY=1))
 repository.Gdk = types.SimpleNamespace()
 repository.GLib = types.SimpleNamespace(SOURCE_REMOVE=False)
+repository.Gio = types.SimpleNamespace(ApplicationFlags=types.SimpleNamespace(NON_UNIQUE=32, FLAGS_NONE=0))
 with patch.dict("sys.modules", {"gi": gi, "gi.repository": repository}):
     loader.exec_module(app)
 
@@ -175,6 +177,41 @@ class StateAndSessionTests(unittest.TestCase):
             self.assertEqual(app.load_config(path)["wallpaper"], "")
             self.assertEqual(app.load_config(path.with_name("missing"))["css"], "")
 
+    def test_config_invalid_encoding_uses_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config"
+            path.write_bytes(b"[appearance]\nwallpaper=\xff\n")
+            with self.assertLogs("neogreet", level="WARNING"):
+                self.assertEqual(app.load_config(path), app.load_config(path.with_name("missing")))
+
+    def test_xdg_empty_and_relative_values_use_defaults(self):
+        for value in (None, "", "relative/path"):
+            env = {} if value is None else {"XDG_DATA_DIRS": value, "XDG_CACHE_HOME": value}
+            with self.subTest(value=value), patch.dict(os.environ, env, clear=True):
+                self.assertEqual(app.session_search_paths(),
+                                 ["/usr/local/share/wayland-sessions", "/usr/share/wayland-sessions"])
+                self.assertEqual(app.state_file_path(), os.path.expanduser("~/.cache/neogreet/state.json"))
+        with patch.dict(os.environ, {"XDG_DATA_DIRS": "relative:/opt/sessions::/usr/share",
+                                     "XDG_CACHE_HOME": "/tmp/test-cache"}):
+            self.assertEqual(app.session_search_paths(),
+                             ["/opt/sessions/wayland-sessions", "/usr/share/wayland-sessions"])
+            self.assertEqual(app.state_file_path(), "/tmp/test-cache/neogreet/state.json")
+
+    def test_desktop_locale_independent_of_ui_language(self):
+        entry = {"Name": "Default", "Name[pl]": "Polski", "Name[pl_PL]": "Regional",
+                 "Name[fr]": "Francais", "Name[sr_YU@Latn]": "Full",
+                 "Name[sr_YU]": "Country", "Name[sr@Latn]": "Modifier", "Name[sr]": "Language"}
+        for value, expected in (("pl_PL.UTF-8", "Regional"), ("fr_FR.UTF-8", "Francais"),
+                                ("C", "Default"), ("sr_YU.UTF-8@Latn", "Full"),
+                                ("sr_YU@Other", "Country"), ("sr_RS@Latn", "Modifier"),
+                                ("sr_RS", "Language")):
+            with self.subTest(locale=value), patch.dict(os.environ, {"LC_ALL": value}):
+                self.assertEqual(app.localized_value(entry, "Name"), expected)
+
+    def test_desktop_string_escaping(self):
+        with patch.dict(os.environ, {"LC_ALL": "C"}):
+            self.assertEqual(app.localized_value({"Name": r"My\sSession"}, "Name"), "My Session")
+
     def test_exec_expansion(self):
         self.assertEqual(app.session_command('session "two words" %U %c %k %% %i', "My session", "/a.desktop", "icon"),
                          ["session", "two words", "My session", "/a.desktop", "%", "--icon", "icon"])
@@ -182,6 +219,44 @@ class StateAndSessionTests(unittest.TestCase):
             app.session_command("session %Q", "name", "file")
         with self.assertRaises(ValueError):
             app.session_command('session "broken', "name", "file")
+
+    def test_exec_quoted_escapes_and_empty_arguments(self):
+        cases = [(r'session "\\$literal"', ["session", "$literal"]),
+                 (r'session "\\`literal"', ["session", "`literal"]),
+                 (r'session "a\\\\b"', ["session", "a\\b"]),
+                 (r'session "a\\"b" ""', ["session", 'a"b', ""]),
+                 ('session "two words" "*"', ["session", "two words", "*"])]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(app.session_command(value, "name", "file"), expected)
+
+    def test_exec_survives_greetd_shell_execution(self):
+        # Match greetd's real cmd.join(" ") -> /bin/sh -c boundary, without PAM.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            probe = root / "argument probe"
+            probe.write_text("#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+            probe.chmod(0o755)
+            desktop = root / "session with spaces.desktop"
+            name = "My $(printf expanded) Session"
+            desktop.write_text('[Desktop Entry]\nType=Application\nName=' + name +
+                               '\nExec="' + str(probe) + '" "two words" "" "*" %c %k %i %%\n'
+                               'Icon=fixture-icon\nDesktopNames=Hyprland;wlroots;\n')
+            with patch.dict(os.environ, {"LC_ALL": "C"}):
+                _, session = app.scan_sessions(search_paths=[directory])
+            request = app.session_start_request(session)
+            result = subprocess.run(["/bin/sh", "-c", "exec " + " ".join(request["cmd"])],
+                                    cwd=directory, capture_output=True, text=True, check=True, timeout=3)
+            self.assertEqual(json.loads(result.stdout),
+                             ["two words", "", "*", name, str(desktop), "--icon", "fixture-icon", "%"])
+            self.assertEqual(request["env"], ["XDG_SESSION_TYPE=wayland",
+                                             "XDG_CURRENT_DESKTOP=Hyprland:wlroots",
+                                             "XDG_SESSION_DESKTOP=Hyprland"])
+
+    def test_session_environment_does_not_copy_greeter_environment(self):
+        with patch.dict(os.environ, {"WAYLAND_DISPLAY": "greeter-wayland", "GREETD_SOCK": "/greeter",
+                                     "DBUS_SESSION_BUS_ADDRESS": "greeter-bus", "XDG_CURRENT_DESKTOP": "Wrong"}):
+            self.assertEqual(app.session_environment({}), ["XDG_SESSION_TYPE=wayland"])
 
     def test_session_filters_localization_and_ids(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -196,7 +271,7 @@ class StateAndSessionTests(unittest.TestCase):
             }
             for name, body in fixtures.items():
                 (root / name).write_text("[Desktop Entry]\n" + body)
-            with patch.object(app, "CURRENT_LANG", "pl"), patch.object(app.shutil, "which", return_value=None):
+            with patch.dict(os.environ, {"LC_ALL": "pl_PL.UTF-8"}), patch.object(app.shutil, "which", return_value=None):
                 sessions, selected = app.scan_sessions("b.desktop", [directory])
                 self.assertEqual(len(sessions), 3)
                 self.assertEqual(selected["id"], "b.desktop")
@@ -217,22 +292,25 @@ class UIStateTests(unittest.TestCase):
     def window(self):
         # Bind production state-machine methods to a display-free test harness.
         window = types.SimpleNamespace(busy=False, auth_active=False, awaiting_response=False,
-                                       starting=False, cancelling=False, is_demo=False)
+                                       prompt_kind=None, starting=False, cancelling=False, is_demo=False)
         for name in ("on_login", "_on_login_result", "on_cancel", "reset_auth", "show_error"):
             setattr(window, name, types.MethodType(getattr(app.NeogreetWindow, name), window))
         for name in ("user_entry", "pass_entry", "login_btn", "cancel_btn", "session_btn",
                      "session_popover", "status_label"):
             setattr(window, name, Mock())
         window.user_entry.get_text.return_value = "alice"
-        window.selected_session = {"name": "Session", "cmd": ["session"], "id": "session.desktop"}
-        window.send_request = Mock()
+        window.selected_session = {"name": "Session", "cmd": ["session"], "id": "session.desktop",
+                                   "env": ["XDG_SESSION_TYPE=wayland"]}
+        # Preserve the real busy transition while keeping replies under test control.
+        window.send_request = Mock(side_effect=lambda _: setattr(window, "busy", True))
         return window
 
     def test_repeated_enter_is_ignored(self):
         window = self.window()
-        window.busy = True
         window.on_login()
-        window.send_request.assert_not_called()
+        for _ in range(100):
+            window.on_login()
+        window.send_request.assert_called_once_with({"type": "create_session", "username": "alice"})
 
     def test_no_fallback_session(self):
         window = self.window()
@@ -257,13 +335,21 @@ class UIStateTests(unittest.TestCase):
     def test_info_and_error_acknowledgements(self):
         for kind in ("info", "error"):
             window = self.window()
+            window.on_login()
+            window.send_request.reset_mock()
             window._on_login_result({"type": "auth_message", "auth_message_type": kind, "auth_message": "PAM notice"})
             window.status_label.set_text.assert_called_with("PAM notice")
+            window.send_request.assert_not_called()
+            self.assertTrue(window.awaiting_response)
+            window.pass_entry.set_visible.assert_called_with(False)
+            window.on_login()
             window.send_request.assert_called_with({"type": "post_auth_message_response", "response": None})
+            window.pass_entry.get_text.assert_not_called()
 
     def test_cancel_and_retry(self):
         window = self.window()
         window.on_login()
+        window._on_login_result({"type": "auth_message", "auth_message_type": "secret", "auth_message": "Password"})
         window.on_cancel(None)
         window.send_request.assert_called_with({"type": "cancel_session"})
         window._on_login_result({"type": "success"})
@@ -280,10 +366,36 @@ class UIStateTests(unittest.TestCase):
 
     def test_start_uses_frozen_selection(self):
         window = self.window()
+        window.selected_session["cmd"] = ["session", "two words", ""]
         window.on_login()
+        window.selected_session["cmd"].append("unexpected")
+        window.selected_session["env"].append("UNEXPECTED=1")
         window.selected_session = {"cmd": ["other"]}
         window._on_login_result({"type": "success"})
-        window.send_request.assert_called_with({"type": "start_session", "cmd": ["session"], "env": []})
+        window.send_request.assert_called_with({"type": "start_session", "cmd": ["session 'two words' ''"],
+                                               "env": ["XDG_SESSION_TYPE=wayland"]})
+
+    def test_start_failure_allows_retry(self):
+        window = self.window()
+        window.on_login()
+        window._on_login_result({"type": "success"})
+        self.assertTrue(window.starting)
+        window._on_login_result({"type": "error", "description": "Cannot start session"})
+        self.assertFalse(window.auth_active)
+        self.assertFalse(window.busy)
+        window.status_label.set_text.assert_called_with("Cannot start session")
+        window.on_login()
+        window.send_request.assert_called_with({"type": "create_session", "username": "alice"})
+
+    def test_cancel_information_message(self):
+        window = self.window()
+        window.on_login()
+        window._on_login_result({"type": "auth_message", "auth_message_type": "info", "auth_message": "Notice"})
+        window.on_cancel(None)
+        window.send_request.assert_called_with({"type": "cancel_session"})
+        window._on_login_result({"type": "success"})
+        self.assertFalse(window.awaiting_response)
+        self.assertIsNone(window.prompt_kind)
 
     def test_demo_power_buttons_do_not_execute_commands(self):
         window = self.window()

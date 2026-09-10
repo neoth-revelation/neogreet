@@ -19,6 +19,9 @@ with tempfile.TemporaryDirectory() as directory:
     config = {"wallpaper": "", "clock_format": "%A %B %H:%M", "css": ""}
     failures = []
     with patch.dict(os.environ, {"XDG_DATA_DIRS": directory, "GREETD_SOCK": "/must-not-connect"}), \
+            patch.object(module, "STATE_FILE", str(Path(directory) / "state.json")), \
+            patch.object(module, "save_state", side_effect=AssertionError("Demo wrote state")), \
+            patch.object(module.subprocess, "run", side_effect=AssertionError("Demo executed power action")), \
             patch.object(module.GreetdClient, "_connect", side_effect=AssertionError("Demo connected to greetd")):
         application = module.NeogreetApp(is_demo=True, config=config)
         stages = [0]
@@ -29,6 +32,10 @@ with tempfile.TemporaryDirectory() as directory:
                 if window is None or window.busy:
                     return GLib.SOURCE_CONTINUE
                 if stages[0] == 0:
+                    application.activate()
+                    assert application.get_windows() == [window]
+                    window.on_reboot(None)
+                    window.on_poweroff(None)
                     window.user_entry.set_text("demo")
                     window.on_login()
                     stages[0] = 1

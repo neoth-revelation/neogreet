@@ -24,7 +24,7 @@ from datetime import datetime
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gtk, Gdk, GLib
+from gi.repository import Gtk, Gdk, GLib, Gio
 
 
 try:
@@ -86,21 +86,35 @@ TRANSLATIONS = {
 }
 
 
-def detect_language():
+def message_locale():
     for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
         val = os.environ.get(var)
         if val:
-            code = val.split(".")[0].split("_")[0].lower()
-            return code if code in TRANSLATIONS else "en"
+            return val
     try:
-        loc = locale.getlocale(locale.LC_MESSAGES)[0]
-        if loc:
-            code = loc.split("_")[0].lower()
-            if code in TRANSLATIONS:
-                return code
-    except Exception:
-        pass
-    return "en"
+        return locale.setlocale(locale.LC_MESSAGES)
+    except locale.Error:
+        return "C"
+
+
+def detect_language():
+    code = message_locale().split("@")[0].split(".")[0].split("_")[0].lower()
+    return code if code in TRANSLATIONS else "en"
+
+
+def localized_value(entry, key):
+    # Desktop names are localized independently of our English/Polish UI.
+    base, _, modifier = message_locale().partition("@")
+    base = base.split(".")[0]
+    language = base.split("_")[0]
+    candidates = ([f"{base}@{modifier}"] if modifier else []) + [base]
+    if modifier:
+        candidates.append(f"{language}@{modifier}")
+    candidates.append(language)
+    for candidate in dict.fromkeys(candidates):
+        if f"{key}[{candidate}]" in entry:
+            return desktop_string(entry[f"{key}[{candidate}]"])
+    return desktop_string(entry.get(key, ""))
 
 
 CURRENT_LANG = detect_language()
@@ -111,8 +125,21 @@ def tr(key):
     return lang_dict.get(key, TRANSLATIONS["en"].get(key, key))
 
 
-STATE_FILE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
-                          "neogreet", "state.json")
+def state_file_path():
+    cache = os.environ.get("XDG_CACHE_HOME", "")
+    if not os.path.isabs(cache):
+        cache = os.path.expanduser("~/.cache")
+    return os.path.join(cache, "neogreet", "state.json")
+
+
+def session_search_paths():
+    roots = os.environ.get("XDG_DATA_DIRS", "").split(":")
+    roots = [root for root in roots if os.path.isabs(root)]
+    return [os.path.join(root, "wayland-sessions")
+            for root in (roots or ["/usr/local/share", "/usr/share"])]
+
+
+STATE_FILE = state_file_path()
 LOG = logging.getLogger("neogreet")
 
 
@@ -163,7 +190,7 @@ def load_config(path):
                            for key, value in config.items()})
     except FileNotFoundError:
         pass
-    except (OSError, configparser.Error):
+    except (OSError, UnicodeError, configparser.Error):
         LOG.warning("Cannot read configuration; using defaults")
     return config
 
@@ -249,8 +276,7 @@ class GreetdClient:
             return {"type": "error", "description": tr("no_greetd_conn")}
 
 
-def session_command(value, name, filename, icon=""):
-    # Desktop Entry escaping is applied before Exec tokenization.
+def desktop_string(value):
     escapes = {"s": " ", "n": "\n", "t": "\t", "r": "\r", "\\": "\\"}
     unescaped = []
     i = 0
@@ -261,12 +287,41 @@ def session_command(value, name, filename, icon=""):
         else:
             unescaped.append(value[i])
         i += 1
-    lexer = shlex.shlex("".join(unescaped), posix=True)
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    lexer.quotes = '"'
+    return "".join(unescaped)
+
+
+def desktop_exec_tokens(value):
+    # String escaping precedes Exec quoting. shlex does not unescape $ and `
+    # inside double quotes as required by the Desktop Entry specification.
+    tokens, token = [], []
+    quoted = started = False
+    chars = iter(desktop_string(value))
+    for char in chars:
+        if char == '"':
+            quoted = not quoted
+            started = True
+        elif char == "\\" and quoted:
+            escaped = next(chars, None)
+            if escaped not in ('"', "\\", "$", "`"):
+                raise ValueError("Invalid Exec escape")
+            token.append(escaped)
+        elif char in " \t\r\n" and not quoted:
+            if started:
+                tokens.append("".join(token))
+                token, started = [], False
+        else:
+            token.append(char)
+            started = True
+    if quoted:
+        raise ValueError("Unterminated Exec quote")
+    if started:
+        tokens.append("".join(token))
+    return tokens
+
+
+def session_command(value, name, filename, icon=""):
     command = []
-    for token in lexer:
+    for token in desktop_exec_tokens(value):
         if token in ("%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N", "%v", "%m"):
             continue
         if token == "%i":
@@ -285,9 +340,25 @@ def session_command(value, name, filename, icon=""):
                 expanded.append(token[i])
             i += 1
         command.append("".join(expanded))
-    if not command or not command[0]:
-        raise ValueError("Empty Exec command")
+    if not command or not command[0] or "=" in command[0] or any("\0" in arg for arg in command):
+        raise ValueError("Invalid Exec command")
     return command
+
+
+def session_environment(entry):
+    environment = ["XDG_SESSION_TYPE=wayland"]
+    desktops = [name for name in desktop_string(entry.get("DesktopNames", "")).split(";") if name]
+    if desktops:
+        environment.extend(["XDG_CURRENT_DESKTOP=" + ":".join(desktops),
+                            "XDG_SESSION_DESKTOP=" + desktops[0]])
+    return environment
+
+
+def session_start_request(session):
+    # greetd joins cmd with spaces and runs /bin/sh -c. Quote the parsed argv
+    # exactly once at that boundary, rather than letting the shell reinterpret it.
+    return {"type": "start_session", "cmd": [shlex.join(session["cmd"])],
+            "env": list(session["env"])}
 
 
 def scan_sessions(last_session_name="", search_paths=None):
@@ -296,8 +367,7 @@ def scan_sessions(last_session_name="", search_paths=None):
     # Starting an X11 .desktop Exec directly does not start an X server.
     # Only advertise sessions we can actually launch.
     if search_paths is None:
-        roots = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")
-        search_paths = [os.path.join(root, "wayland-sessions") for root in roots if root]
+        search_paths = session_search_paths()
     seen_ids = set()
 
     for p in search_paths:
@@ -316,12 +386,13 @@ def scan_sessions(last_session_name="", search_paths=None):
                     continue
                 if entry.get("Type", "Application") != "Application" or entry.getboolean("Terminal", False):
                     continue
-                if entry.get("TryExec") and not shutil.which(entry["TryExec"]):
+                if entry.get("TryExec") and not shutil.which(desktop_string(entry["TryExec"])):
                     continue
-                name = entry.get(f"Name[{CURRENT_LANG}]", entry.get("Name", ""))
-                cmd = session_command(entry["Exec"], name, f, entry.get("Icon", ""))
+                name = localized_value(entry, "Name")
+                cmd = session_command(entry["Exec"], name, f, localized_value(entry, "Icon"))
                 if name:
-                    item = {"name": name, "cmd": cmd, "file": f, "id": session_id}
+                    item = {"name": name, "cmd": cmd, "env": session_environment(entry),
+                            "file": f, "id": session_id}
                     sessions.append(item)
                     if last_session_name in (session_id, name):
                         selected_session = item
@@ -517,6 +588,7 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         self.busy = False
         self.auth_active = False
         self.awaiting_response = False
+        self.prompt_kind = None
         self.starting = False
         self.cancelling = False
         self.power_busy = False
@@ -767,7 +839,8 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         if self.busy:
             return
         if self.awaiting_response:
-            response = self.pass_entry.get_text()
+            response = (self.pass_entry.get_text()
+                        if self.prompt_kind in ("secret", "visible") else None)
             self.pass_entry.set_text("")
             self.pass_entry.set_visibility(False)
             self.awaiting_response = False
@@ -787,7 +860,9 @@ class NeogreetWindow(Gtk.ApplicationWindow):
             return
         self.auth_active = True
         self.login_user = username
-        self.login_session = dict(self.selected_session)
+        self.login_session = {**self.selected_session,
+                              "cmd": list(self.selected_session["cmd"]),
+                              "env": list(self.selected_session["env"])}
         self.user_entry.set_sensitive(False)
         self.session_btn.set_sensitive(False)
         self.session_popover.popdown()
@@ -817,6 +892,7 @@ class NeogreetWindow(Gtk.ApplicationWindow):
 
     def reset_auth(self):
         self.auth_active = self.awaiting_response = self.starting = self.cancelling = False
+        self.prompt_kind = None
         self.user_entry.set_sensitive(True)
         self.session_btn.set_sensitive(True)
         self.login_btn.set_label(tr("login_btn"))
@@ -839,25 +915,28 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         if res["type"] == "auth_message":
             kind = res["auth_message_type"]
             self.show_error(res["auth_message"])
+            self.prompt_kind = kind
+            self.awaiting_response = True
+            self.pass_entry.set_text("")
+            self.pass_entry.set_visibility(kind == "visible")
+            self.login_btn.set_label(tr("continue_btn"))
+            self.login_btn.set_sensitive(True)
+            self.cancel_btn.set_sensitive(True)
             if kind in ("info", "error"):
                 self.pass_entry.set_visible(False)
-                self.send_request({"type": "post_auth_message_response", "response": None})
+                # Leave notices visible until the user acknowledges them. In
+                # particular, don't overwrite them with the next prompt in one frame.
+                self.login_btn.grab_focus()
             else:
-                self.awaiting_response = True
-                self.pass_entry.set_text("")
-                self.pass_entry.set_visibility(kind == "visible")
                 self.pass_entry.set_icon_from_icon_name(
                     Gtk.EntryIconPosition.SECONDARY, "view-reveal-symbolic")
                 self.pass_entry.set_placeholder_text(res["auth_message"])
                 self.pass_entry.set_visible(True)
                 self.pass_entry.set_sensitive(True)
-                self.login_btn.set_label(tr("continue_btn"))
-                self.login_btn.set_sensitive(True)
-                self.cancel_btn.set_sensitive(True)
                 self.pass_entry.grab_focus()
         elif res["type"] == "success" and not self.starting:
             self.starting = True
-            self.send_request({"type": "start_session", "cmd": self.login_session["cmd"], "env": []})
+            self.send_request(session_start_request(self.login_session))
         elif res["type"] == "success":
             self.pass_entry.set_text("")
             if not self.is_demo:
@@ -882,11 +961,16 @@ class NeogreetWindow(Gtk.ApplicationWindow):
 
 class NeogreetApp(Gtk.Application):
     def __init__(self, is_demo=False, config=None):
-        super().__init__(application_id="apps.neoth.neogreet")
+        super().__init__(application_id="apps.neoth.neogreet.demo" if is_demo else "apps.neoth.neogreet",
+                         flags=Gio.ApplicationFlags.NON_UNIQUE if is_demo else Gio.ApplicationFlags.FLAGS_NONE)
         self.is_demo = is_demo
         self.config = config or load_config("/etc/greetd/neogreet.conf")
 
     def do_activate(self):
+        windows = self.get_windows()
+        if windows:
+            windows[0].present()
+            return
         css_provider = Gtk.CssProvider()
         css_provider.load_from_data(CSS_DATA)
         Gtk.StyleContext.add_provider_for_display(
