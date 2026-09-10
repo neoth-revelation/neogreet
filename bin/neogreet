@@ -13,6 +13,12 @@ import shlex
 import glob
 import locale
 import threading
+import argparse
+import configparser
+import logging
+import shutil
+import subprocess
+import tempfile
 from datetime import datetime
 
 import gi
@@ -32,6 +38,12 @@ except Exception:
 
 TRANSLATIONS = {
     "en": {
+        "continue_btn": "Continue",
+        "cancel_btn": "Cancel",
+        "demo_title": "neogreet [DEMO] – Press ESC to exit",
+        "no_sessions": "No usable Wayland session found",
+        "power_failed": "Power action failed; check the journal and logind permissions",
+        "confirm_power": "Confirm system power action? Unsaved work may be lost.",
         "user_placeholder": "Username",
         "password_placeholder": "Password",
         "login_btn": "Log In",
@@ -49,6 +61,12 @@ TRANSLATIONS = {
         "demo_poweroff": "[DEMO] Simulation: power off system",
     },
     "pl": {
+        "continue_btn": "Dalej",
+        "cancel_btn": "Anuluj",
+        "demo_title": "neogreet [DEMO] – Wciśnij ESC aby wyjść",
+        "no_sessions": "Nie znaleziono dostępnej sesji Wayland",
+        "power_failed": "Operacja zasilania nie powiodła się; sprawdź dziennik i uprawnienia logind",
+        "confirm_power": "Potwierdzić operację zasilania? Niezapisana praca może zostać utracona.",
         "user_placeholder": "Użytkownik",
         "password_placeholder": "Hasło",
         "login_btn": "Zaloguj",
@@ -73,8 +91,7 @@ def detect_language():
         val = os.environ.get(var)
         if val:
             code = val.split(".")[0].split("_")[0].lower()
-            if code in TRANSLATIONS:
-                return code
+            return code if code in TRANSLATIONS else "en"
     try:
         loc = locale.getlocale(locale.LC_MESSAGES)[0]
         if loc:
@@ -94,39 +111,83 @@ def tr(key):
     return lang_dict.get(key, TRANSLATIONS["en"].get(key, key))
 
 
-STATE_FILE = os.path.expanduser("~/.cache/neogreet/state.json")
+STATE_FILE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+                          "neogreet", "state.json")
+LOG = logging.getLogger("neogreet")
 
 
 def load_state():
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
+                state = json.load(f)
+                if not isinstance(state, dict) or any(
+                    not isinstance(state.get(key, ""), str)
+                    for key in ("last_user", "last_session")
+                ):
+                    raise ValueError("Invalid state structure")
+                return state
+    except (OSError, ValueError):
+        LOG.warning("Cannot read state; using defaults")
     return {"last_user": "", "last_session": "Hyprland (uwsm-managed)"}
 
 
 def save_state(user, session_name):
+    temporary = None
     try:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                         dir=os.path.dirname(STATE_FILE), delete=False) as f:
+            temporary = f.name
             json.dump({"last_user": user, "last_session": session_name}, f)
-    except Exception:
+        os.replace(temporary, STATE_FILE)
+    except OSError:
+        LOG.warning("Cannot save state; check greeter cache permissions")
+    finally:
+        if temporary and os.path.exists(temporary):
+            try:
+                os.unlink(temporary)
+            except OSError:
+                LOG.warning("Cannot remove temporary state file")
+
+
+def load_config(path):
+    config = {"wallpaper": "/usr/share/backgrounds/greeter.png",
+              "clock_format": "%A, %d %B %H:%M", "css": ""}
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        with open(path, encoding="utf-8") as stream:
+            parser.read_file(stream)
+        if parser.has_section("appearance"):
+            config.update({key: parser.get("appearance", key, fallback=value)
+                           for key, value in config.items()})
+    except FileNotFoundError:
         pass
+    except (OSError, configparser.Error):
+        LOG.warning("Cannot read configuration; using defaults")
+    return config
 
 
 class GreetdClient:
-    def __init__(self):
-        sock_path = os.environ.get("GREETD_SOCK")
+    MAX_MESSAGE = 1024 * 1024
+
+    def __init__(self, is_demo=False):
+        self.is_demo = is_demo
         self.sock = None
-        if sock_path and os.path.exists(sock_path):
-            try:
-                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self.sock.connect(sock_path)
-            except Exception as e:
-                print(f"Failed to connect to greetd socket: {e}", file=sys.stderr)
-                self.sock = None
+        self.needs_reset = False
+
+    def close(self):
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
+
+    def _connect(self):
+        sock_path = os.environ.get("GREETD_SOCK")
+        if not sock_path:
+            raise OSError(tr("no_greetd_conn"))
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(60)
+        self.sock.connect(sock_path)
 
     def _recv_exact(self, n):
         buf = bytearray()
@@ -137,85 +198,137 @@ class GreetdClient:
             buf.extend(chunk)
         return bytes(buf)
 
-    def _send(self, payload):
-        if not self.sock:
+    def request(self, payload):
+        # Demo is explicit and never opens a socket, even if GREETD_SOCK exists.
+        if self.is_demo:
+            if payload["type"] == "create_session":
+                return {"type": "auth_message", "auth_message_type": "secret",
+                        "auth_message": tr("password_placeholder")}
+            if payload.get("response") == "wrong":
+                return {"type": "error", "error_type": "auth_error",
+                        "description": tr("invalid_password")}
             return {"type": "success"}
         try:
+            if self.sock is None:
+                self._connect()
+            if payload["type"] == "create_session" and self.needs_reset:
+                cleanup = self.request({"type": "cancel_session"})
+                if cleanup["type"] != "success":
+                    return cleanup
+                self.needs_reset = False
             data = json.dumps(payload).encode("utf-8")
             self.sock.sendall(struct.pack("=I", len(data)) + data)
             resp_len_bytes = self._recv_exact(4)
             if resp_len_bytes is None:
-                return {"type": "error", "description": "Socket closed"}
+                raise OSError("Socket closed")
             resp_len = struct.unpack("=I", resp_len_bytes)[0]
+            if not 0 < resp_len <= self.MAX_MESSAGE:
+                raise ValueError("Invalid greetd message length")
             resp_data = self._recv_exact(resp_len)
             if resp_data is None:
-                return {"type": "error", "description": "Socket closed"}
-            return json.loads(resp_data.decode("utf-8"))
-        except Exception as e:
-            return {"type": "error", "description": str(e)}
+                raise OSError("Socket closed")
+            result = json.loads(resp_data.decode("utf-8"))
+            if not isinstance(result, dict) or result.get("type") not in (
+                "success", "error", "auth_message"
+            ):
+                raise ValueError("Invalid greetd response")
+            if result["type"] == "auth_message" and (
+                result.get("auth_message_type") not in ("secret", "visible", "info", "error")
+                or not isinstance(result.get("auth_message"), str)
+            ):
+                raise ValueError("Invalid authentication message")
+            if result["type"] == "error":
+                if not isinstance(result.get("description", ""), str):
+                    raise ValueError("Invalid error description")
+                self.needs_reset = True
+            return result
+        except (OSError, ValueError, UnicodeError):
+            self.close()
+            self.needs_reset = True
+            LOG.warning("greetd communication failed (details omitted to protect credentials)")
+            return {"type": "error", "description": tr("no_greetd_conn")}
 
-    def login(self, username, password, cmd):
-        if not self.sock:
-            if os.environ.get("NEOGREET_DEMO") == "1" or os.environ.get("ANTIGRAVITY_GREETER_DEMO") == "1":
-                print(f"[DEMO] Login attempt: user={username}, cmd={cmd}")
-                if password == "wrong":
-                    return {"type": "error", "error_type": "auth_error", "description": tr("invalid_password")}
-                return {"type": "success"}
-            return {"type": "error", "error_type": "error", "description": tr("no_greetd_conn")}
 
-        # 1. Create session
-        res = self._send({"type": "create_session", "username": username})
-        while res.get("type") == "auth_message":
-            msg_type = res.get("auth_message_type")
-            if msg_type == "secret":
-                res = self._send({"type": "post_auth_message_response", "response": password})
-            elif msg_type == "visible":
-                res = self._send({"type": "post_auth_message_response", "response": username})
-            else:
-                res = self._send({"type": "post_auth_message_response"})
-
-        if res.get("type") == "success":
-            # 2. Start session
-            start_res = self._send({
-                "type": "start_session",
-                "cmd": cmd,
-                "env": []
-            })
-            return start_res
+def session_command(value, name, filename, icon=""):
+    # Desktop Entry escaping is applied before Exec tokenization.
+    escapes = {"s": " ", "n": "\n", "t": "\t", "r": "\r", "\\": "\\"}
+    unescaped = []
+    i = 0
+    while i < len(value):
+        if value[i] == "\\" and i + 1 < len(value) and value[i + 1] in escapes:
+            i += 1
+            unescaped.append(escapes[value[i]])
         else:
-            # Reset greetd transaction on failure
-            self._send({"type": "cancel_session"})
-            return res
+            unescaped.append(value[i])
+        i += 1
+    lexer = shlex.shlex("".join(unescaped), posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    lexer.quotes = '"'
+    command = []
+    for token in lexer:
+        if token in ("%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N", "%v", "%m"):
+            continue
+        if token == "%i":
+            if icon:
+                command.extend(["--icon", icon])
+            continue
+        expanded = []
+        i = 0
+        while i < len(token):
+            if token[i] == "%":
+                i += 1
+                if i == len(token) or token[i] not in ("%", "c", "k"):
+                    raise ValueError("Unsupported Exec field code")
+                expanded.append({"%": "%", "c": name, "k": filename}[token[i]])
+            else:
+                expanded.append(token[i])
+            i += 1
+        command.append("".join(expanded))
+    if not command or not command[0]:
+        raise ValueError("Empty Exec command")
+    return command
 
 
-def scan_sessions(last_session_name=""):
+def scan_sessions(last_session_name="", search_paths=None):
     sessions = []
     selected_session = None
-    search_paths = ["/usr/share/wayland-sessions", "/usr/share/xsessions"]
-    seen_names = set()
+    # Starting an X11 .desktop Exec directly does not start an X server.
+    # Only advertise sessions we can actually launch.
+    if search_paths is None:
+        roots = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")
+        search_paths = [os.path.join(root, "wayland-sessions") for root in roots if root]
+    seen_ids = set()
 
     for p in search_paths:
         for f in sorted(glob.glob(os.path.join(p, "*.desktop"))):
-            name = None
-            cmd = None
+            session_id = os.path.basename(f)
+            if session_id in seen_ids:
+                continue
+            seen_ids.add(session_id)
             try:
+                parser = configparser.ConfigParser(interpolation=None, strict=False)
+                parser.optionxform = str
                 with open(f, "r", encoding="utf-8") as df:
-                    for line in df:
-                        line = line.strip()
-                        if line.startswith("Name=") and not name:
-                            name = line.split("=", 1)[1]
-                        elif line.startswith("Exec=") and not cmd:
-                            cmd_str = line.split("=", 1)[1]
-                            cmd = shlex.split(cmd_str)
-                if name and cmd and name not in seen_names:
-                    seen_names.add(name)
-                    item = {"name": name, "cmd": cmd, "file": f}
+                    parser.read_file(df)
+                entry = parser["Desktop Entry"]
+                if entry.getboolean("Hidden", False) or entry.getboolean("NoDisplay", False):
+                    continue
+                if entry.get("Type", "Application") != "Application" or entry.getboolean("Terminal", False):
+                    continue
+                if entry.get("TryExec") and not shutil.which(entry["TryExec"]):
+                    continue
+                name = entry.get(f"Name[{CURRENT_LANG}]", entry.get("Name", ""))
+                cmd = session_command(entry["Exec"], name, f, entry.get("Icon", ""))
+                if name:
+                    item = {"name": name, "cmd": cmd, "file": f, "id": session_id}
                     sessions.append(item)
-                    if last_session_name and name == last_session_name:
+                    if last_session_name in (session_id, name):
                         selected_session = item
                     elif not selected_session and "uwsm" in name.lower():
                         selected_session = item
-            except Exception:
+            except (OSError, UnicodeError, ValueError, KeyError, configparser.Error):
+                LOG.warning("Skipping invalid session file: %s", f)
                 continue
 
     if not selected_session and sessions:
@@ -233,7 +346,7 @@ CSS_DATA = b"""
 }
 
 window {
-    background-color: transparent;
+    background-color: #1e1e2e;
     color: #cdd6f4;
     font-family: "JetBrainsMono Nerd Font Propo", "JetBrainsMono Nerd Font", sans-serif;
     font-size: 13pt;
@@ -400,11 +513,18 @@ class NeogreetWindow(Gtk.ApplicationWindow):
     def __init__(self, app, is_demo=False):
         super().__init__(application=app, title="neogreet")
         self.is_demo = is_demo
+        self.config = app.config
+        self.busy = False
+        self.auth_active = False
+        self.awaiting_response = False
+        self.starting = False
+        self.cancelling = False
+        self.power_busy = False
 
         if self.is_demo:
             self.set_default_size(1280, 720)
             self.set_decorated(True)
-            self.set_title("neogreet [DEMO] – Wciśnij ESC aby wyjść")
+            self.set_title(tr("demo_title"))
             # Close cleanly on Escape
             key_ctrl = Gtk.EventControllerKey()
             def on_key_pressed(_c, keyval, _keycode, _state):
@@ -419,7 +539,7 @@ class NeogreetWindow(Gtk.ApplicationWindow):
             self.set_decorated(False)
             self.fullscreen()
 
-        self.client = GreetdClient()
+        self.client = GreetdClient(is_demo=is_demo)
         self.state = load_state()
         self.sessions, self.selected_session = scan_sessions(self.state.get("last_session", ""))
 
@@ -428,7 +548,7 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         self.set_child(overlay)
 
         # 1. Background Wallpaper
-        bg_path = "/usr/share/backgrounds/greeter.png"
+        bg_path = self.config["wallpaper"]
         if os.path.exists(bg_path):
             picture = Gtk.Picture.new_for_filename(bg_path)
             picture.set_content_fit(Gtk.ContentFit.COVER)
@@ -508,12 +628,13 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         self.user_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, "avatar-default-symbolic")
         self.user_entry.set_text(self.state.get("last_user", ""))
         self.user_entry.set_placeholder_text(tr("user_placeholder"))
-        self.user_entry.connect("activate", lambda _: self.pass_entry.grab_focus())
+        self.user_entry.connect("activate", lambda _: self.on_login())
         card.append(self.user_entry)
 
         # Password Field (with key icon inside & peek toggle)
         self.pass_entry = Gtk.Entry()
         self.pass_entry.set_visibility(False)
+        self.pass_entry.set_visible(False)
         self.pass_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, "dialog-password-symbolic")
         self.pass_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, "view-reveal-symbolic")
         self.pass_entry.set_icon_activatable(Gtk.EntryIconPosition.SECONDARY, True)
@@ -524,6 +645,8 @@ class NeogreetWindow(Gtk.ApplicationWindow):
 
         # Error / Status Label
         self.status_label = Gtk.Label()
+        self.status_label.set_wrap(True)
+        self.status_label.set_max_width_chars(48)
         self.status_label.add_css_class("error-label")
         self.status_label.set_visible(False)
         card.append(self.status_label)
@@ -535,18 +658,23 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         self.login_btn.connect("clicked", lambda _: self.on_login())
         card.append(self.login_btn)
 
+        self.cancel_btn = Gtk.Button(label=tr("cancel_btn"))
+        self.cancel_btn.connect("clicked", self.on_cancel)
+        self.cancel_btn.set_visible(False)
+        card.append(self.cancel_btn)
+
         overlay.add_overlay(center_container)
 
-        # Auto-focus password entry cleanly
+        # Authentication questions are shown only when PAM actually asks them.
         def _focus_pass_entry():
-            self.pass_entry.grab_focus()
+            (self.login_btn if self.user_entry.get_text() else self.user_entry).grab_focus()
             return GLib.SOURCE_REMOVE
         GLib.idle_add(_focus_pass_entry)
 
     def update_clock(self):
         now = datetime.now()
-        date_str = now.strftime("%A, %d %B %H:%M")
-        self.clock_label.set_text(date_str.capitalize())
+        date_str = now.strftime(self.config["clock_format"])
+        self.clock_label.set_text(date_str[:1].upper() + date_str[1:])
         return GLib.SOURCE_CONTINUE
 
     def on_password_peek_toggle(self, entry, icon_pos):
@@ -562,13 +690,51 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         if self.is_demo:
             self.show_error(tr("demo_reboot"))
             return
-        os.system("systemctl reboot -i")
+        self.confirm_power("reboot")
 
     def on_poweroff(self, _btn):
         if self.is_demo:
             self.show_error(tr("demo_poweroff"))
             return
-        os.system("systemctl poweroff -i")
+        self.confirm_power("poweroff")
+
+    def confirm_power(self, action):
+        if self.power_busy:
+            return
+        self.power_busy = True
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True,
+                                   message_type=Gtk.MessageType.WARNING,
+                                   buttons=Gtk.ButtonsType.OK_CANCEL,
+                                   text=tr("confirm_power"))
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+
+        def response(window, response_id):
+            window.destroy()
+            if response_id != Gtk.ResponseType.OK:
+                self.power_busy = False
+                return
+
+            def worker():
+                try:
+                    # Respect inhibitors, never launch a terminal/polkit prompt.
+                    result = subprocess.run(["systemctl", "--no-ask-password", action],
+                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL, timeout=30, check=False)
+                    failed = result.returncode != 0
+                except (OSError, subprocess.TimeoutExpired):
+                    failed = True
+                GLib.idle_add(finish, failed)
+
+            def finish(failed):
+                self.power_busy = False
+                if failed:
+                    self.show_error(tr("power_failed"))
+                return GLib.SOURCE_REMOVE
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        dialog.connect("response", response)
+        dialog.present()
 
     def on_session_clicked(self, _btn):
         self.session_popover.popup()
@@ -578,14 +744,17 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         for s in self.sessions:
             btn = Gtk.Button(label=s["name"])
             btn.add_css_class("session-row")
-            if self.selected_session and s["name"] == self.selected_session["name"]:
+            if self.selected_session and s["id"] == self.selected_session["id"]:
                 btn.add_css_class("active")
 
             def make_handler(sess):
                 def handler(_):
+                    if self.auth_active:
+                        return
                     self.selected_session = sess
                     self.session_btn.set_tooltip_text(f"{tr('session_prefix')}: {sess['name']}")
-                    save_state(self.user_entry.get_text().strip(), sess["name"])
+                    if not self.is_demo:
+                        save_state(self.user_entry.get_text().strip(), sess["id"])
                     self.build_session_menu()
                     self.session_popover.popdown()
                 return handler
@@ -595,29 +764,104 @@ class NeogreetWindow(Gtk.ApplicationWindow):
         self.session_popover.set_child(vbox)
 
     def on_login(self):
+        if self.busy:
+            return
+        if self.awaiting_response:
+            response = self.pass_entry.get_text()
+            self.pass_entry.set_text("")
+            self.pass_entry.set_visibility(False)
+            self.awaiting_response = False
+            self.send_request({"type": "post_auth_message_response", "response": response})
+            return
+        if self.auth_active:
+            return
         username = self.user_entry.get_text().strip()
-        password = self.pass_entry.get_text()
 
         if not username:
             self.show_error(tr("enter_username"))
             self.user_entry.grab_focus()
             return
 
-        self.login_btn.set_sensitive(False)
+        if not self.selected_session:
+            self.show_error(tr("no_sessions"))
+            return
+        self.auth_active = True
+        self.login_user = username
+        self.login_session = dict(self.selected_session)
+        self.user_entry.set_sensitive(False)
+        self.session_btn.set_sensitive(False)
+        self.session_popover.popdown()
+        self.cancel_btn.set_visible(True)
         self.status_label.set_text(tr("logging_in"))
         self.status_label.set_visible(True)
+        self.send_request({"type": "create_session", "username": username})
 
-        cmd = self.selected_session["cmd"] if self.selected_session else ["Hyprland"]
+    def send_request(self, payload):
+        self.busy = True
+        self.login_btn.set_sensitive(False)
+        self.pass_entry.set_sensitive(False)
+        self.cancel_btn.set_sensitive(False)
 
         def worker():
-            res = self.client.login(username, password, cmd)
-            GLib.idle_add(self._on_login_result, username, res)
+            res = self.client.request(payload)
+            GLib.idle_add(self._on_login_result, res)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_login_result(self, username, res):
-        if res.get("type") == "success":
-            save_state(username, self.selected_session["name"] if self.selected_session else "")
+    def on_cancel(self, _button):
+        if self.busy or not self.auth_active:
+            return
+        self.cancelling = True
+        self.pass_entry.set_text("")
+        self.send_request({"type": "cancel_session"})
+
+    def reset_auth(self):
+        self.auth_active = self.awaiting_response = self.starting = self.cancelling = False
+        self.user_entry.set_sensitive(True)
+        self.session_btn.set_sensitive(True)
+        self.login_btn.set_label(tr("login_btn"))
+        self.login_btn.set_sensitive(True)
+        self.pass_entry.set_text("")
+        self.pass_entry.set_visibility(False)
+        self.pass_entry.set_visible(False)
+        self.cancel_btn.set_visible(False)
+        self.login_btn.grab_focus()
+
+    def _on_login_result(self, res):
+        self.busy = False
+        if self.cancelling:
+            self.reset_auth()
+            if res["type"] == "error":
+                self.show_error(res.get("description") or tr("login_failed"))
+            else:
+                self.status_label.set_visible(False)
+            return GLib.SOURCE_REMOVE
+        if res["type"] == "auth_message":
+            kind = res["auth_message_type"]
+            self.show_error(res["auth_message"])
+            if kind in ("info", "error"):
+                self.pass_entry.set_visible(False)
+                self.send_request({"type": "post_auth_message_response", "response": None})
+            else:
+                self.awaiting_response = True
+                self.pass_entry.set_text("")
+                self.pass_entry.set_visibility(kind == "visible")
+                self.pass_entry.set_icon_from_icon_name(
+                    Gtk.EntryIconPosition.SECONDARY, "view-reveal-symbolic")
+                self.pass_entry.set_placeholder_text(res["auth_message"])
+                self.pass_entry.set_visible(True)
+                self.pass_entry.set_sensitive(True)
+                self.login_btn.set_label(tr("continue_btn"))
+                self.login_btn.set_sensitive(True)
+                self.cancel_btn.set_sensitive(True)
+                self.pass_entry.grab_focus()
+        elif res["type"] == "success" and not self.starting:
+            self.starting = True
+            self.send_request({"type": "start_session", "cmd": self.login_session["cmd"], "env": []})
+        elif res["type"] == "success":
+            self.pass_entry.set_text("")
+            if not self.is_demo:
+                save_state(self.login_user, self.login_session["id"])
             if self.is_demo:
                 self.status_label.set_text(tr("login_success_demo"))
                 self.status_label.set_visible(True)
@@ -626,12 +870,9 @@ class NeogreetWindow(Gtk.ApplicationWindow):
                 self.get_application().quit()
         else:
             err_desc = res.get("description") or tr("login_failed")
-            if res.get("error_type") == "auth_error":
-                err_desc = tr("invalid_password")
+            # greetd cancels failed sessions; preserve the real PAM description.
+            self.reset_auth()
             self.show_error(err_desc)
-            self.login_btn.set_sensitive(True)
-            self.pass_entry.set_text("")
-            self.pass_entry.grab_focus()
         return GLib.SOURCE_REMOVE
 
     def show_error(self, message):
@@ -640,9 +881,10 @@ class NeogreetWindow(Gtk.ApplicationWindow):
 
 
 class NeogreetApp(Gtk.Application):
-    def __init__(self, is_demo=False):
+    def __init__(self, is_demo=False, config=None):
         super().__init__(application_id="apps.neoth.neogreet")
         self.is_demo = is_demo
+        self.config = config or load_config("/etc/greetd/neogreet.conf")
 
     def do_activate(self):
         css_provider = Gtk.CssProvider()
@@ -652,32 +894,24 @@ class NeogreetApp(Gtk.Application):
             css_provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
+        if self.config["css"]:
+            try:
+                custom_css = Gtk.CssProvider()
+                custom_css.load_from_path(self.config["css"])
+                Gtk.StyleContext.add_provider_for_display(
+                    Gdk.Display.get_default(), custom_css,
+                    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+            except GLib.Error:
+                LOG.warning("Cannot load custom CSS; using built-in theme")
 
         win = NeogreetWindow(self, is_demo=self.is_demo)
         win.present()
 
 
 if __name__ == "__main__":
-    is_demo = False
-    filtered_argv = [sys.argv[0]]
-    for arg in sys.argv[1:]:
-        if arg in ("--demo", "-d"):
-            is_demo = True
-            os.environ["NEOGREET_DEMO"] = "1"
-        elif arg in ("--help", "-h"):
-            if CURRENT_LANG == "pl":
-                print("Użycie: neogreet [OPCJE]")
-                print("Opcje:")
-                print("  -d, --demo    Uruchamia greeter w oknie testowym (bez połączenia z greetd)")
-                print("  -h, --help    Wyświetla pomoc")
-            else:
-                print("Usage: neogreet [OPTIONS]")
-                print("Options:")
-                print("  -d, --demo    Launch greeter in a floating test window (without greetd connection)")
-                print("  -h, --help    Display this help message")
-            sys.exit(0)
-        else:
-            filtered_argv.append(arg)
-
-    app = NeogreetApp(is_demo=is_demo)
-    app.run(filtered_argv)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-d", "--demo", action="store_true", help="Preview without greetd or power actions")
+    parser.add_argument("--config", default="/etc/greetd/neogreet.conf", help="Appearance configuration file")
+    args = parser.parse_args()
+    app = NeogreetApp(is_demo=args.demo, config=load_config(args.config))
+    app.run([sys.argv[0]])
